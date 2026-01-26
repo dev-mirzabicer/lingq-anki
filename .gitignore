@@ -1,0 +1,32 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Development/exploration scripts
+probe_*.py
+asd.py
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Ruff cache
+.ruff_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sisyphus tracking (internal)
+.sisyphus/
