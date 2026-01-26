@@ -1,0 +1,11 @@
+[project]
+name = "lingq-anki-sync"
+version = "0.1.0"
+requires-python = ">=3.9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+norecursedirs = ["__pycache__"]
+python_classes = ["Test*"]
+addopts = "--ignore=__init__.py --ignore=sync_dialog.py --ignore=config_manager.py"
