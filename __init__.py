@@ -1,21 +1,24 @@
 # pyright: reportMissingImports=false
-import importlib
+from __future__ import annotations
 
-aqt = importlib.import_module("aqt")
-gui_hooks = aqt.gui_hooks
-mw = aqt.mw
+_IN_ANKI = False
+try:
+    import aqt
 
-from .sync_dialog import SyncDialog
+    _IN_ANKI = aqt.mw is not None
+except ImportError:
+    pass
 
+if _IN_ANKI:
+    from aqt import gui_hooks, mw
+    import sync_dialog
 
-def show_sync_dialog() -> None:
-    dialog = SyncDialog(mw)
-    dialog.exec()
+    def show_sync_dialog() -> None:
+        dialog = sync_dialog.SyncDialog(mw)
+        dialog.exec()
 
+    def _register_menu_action() -> None:
+        action = mw.form.menuTools.addAction("LingQ Sync...")
+        action.triggered.connect(show_sync_dialog)
 
-def _register_menu_action() -> None:
-    action = mw.form.menuTools.addAction("LingQ Sync...")
-    action.triggered.connect(show_sync_dialog)
-
-
-gui_hooks.main_window_did_init.append(_register_menu_action)
+    gui_hooks.main_window_did_init.append(_register_menu_action)

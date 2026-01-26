@@ -2,7 +2,7 @@ import sys
 from unittest.mock import MagicMock
 
 mock_aqt = MagicMock()
-mock_aqt.mw = MagicMock()
+mock_aqt.mw = None  # Set to None so add-on init is skipped during tests
 mock_aqt.gui_hooks = MagicMock()
 mock_aqt.qt = MagicMock()
 
