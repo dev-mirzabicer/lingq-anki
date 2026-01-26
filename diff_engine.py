@@ -3,9 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, cast
 
-from hint_reconciliation import build_hints_payload, find_missing_hints
-from matching import normalize_text
-from progress_sync import compare_progress, has_polysemy, lingq_status_to_tier
+try:
+    from .hint_reconciliation import build_hints_payload, find_missing_hints
+    from .matching import normalize_text
+    from .progress_sync import compare_progress, has_polysemy, lingq_status_to_tier
+except ImportError:
+    from hint_reconciliation import build_hints_payload, find_missing_hints  # type: ignore[no-redef]
+    from matching import normalize_text  # type: ignore[no-redef]
+    from progress_sync import compare_progress, has_polysemy, lingq_status_to_tier  # type: ignore[no-redef]
 
 
 OP_CREATE_LINGQ = "create_lingq"  # create new LingQ card from Anki

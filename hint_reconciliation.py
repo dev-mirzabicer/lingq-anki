@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-from matching import normalize_text
+try:
+    from .matching import normalize_text
+except ImportError:
+    from matching import normalize_text  # type: ignore[no-redef]
 
 
 def normalize_hint_text(text: str) -> str:

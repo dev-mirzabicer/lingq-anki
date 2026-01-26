@@ -11,7 +11,11 @@ except ImportError:
 
 if _IN_ANKI:
     from aqt import gui_hooks, mw
-    import sync_dialog
+
+    try:
+        from . import sync_dialog
+    except ImportError:
+        import sync_dialog  # type: ignore[no-redef]
 
     def show_sync_dialog() -> None:
         dialog = sync_dialog.SyncDialog(mw)

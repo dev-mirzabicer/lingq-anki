@@ -3,13 +3,22 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any, Dict, List
 
-from config_model import (
-    AnkiToLingqMapping,
-    Config,
-    IdentityFields,
-    LingqToAnkiMapping,
-    Profile,
-)
+try:
+    from .config_model import (
+        AnkiToLingqMapping,
+        Config,
+        IdentityFields,
+        LingqToAnkiMapping,
+        Profile,
+    )
+except ImportError:
+    from config_model import (  # type: ignore[no-redef]
+        AnkiToLingqMapping,
+        Config,
+        IdentityFields,
+        LingqToAnkiMapping,
+        Profile,
+    )
 
 # pyright: reportMissingImports=false
 import importlib

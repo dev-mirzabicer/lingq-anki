@@ -10,19 +10,34 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from diff_engine import (
-    OP_CONFLICT,
-    OP_CREATE_ANKI,
-    OP_CREATE_LINGQ,
-    OP_LINK,
-    OP_RESCHEDULE_ANKI,
-    OP_SKIP,
-    OP_UPDATE_HINTS,
-    OP_UPDATE_STATUS,
-    SyncOperation,
-    SyncPlan,
-)
-from lingq_client import LingQClient
+try:
+    from .diff_engine import (
+        OP_CONFLICT,
+        OP_CREATE_ANKI,
+        OP_CREATE_LINGQ,
+        OP_LINK,
+        OP_RESCHEDULE_ANKI,
+        OP_SKIP,
+        OP_UPDATE_HINTS,
+        OP_UPDATE_STATUS,
+        SyncOperation,
+        SyncPlan,
+    )
+    from .lingq_client import LingQClient
+except ImportError:
+    from diff_engine import (  # type: ignore[no-redef]
+        OP_CONFLICT,
+        OP_CREATE_ANKI,
+        OP_CREATE_LINGQ,
+        OP_LINK,
+        OP_RESCHEDULE_ANKI,
+        OP_SKIP,
+        OP_UPDATE_HINTS,
+        OP_UPDATE_STATUS,
+        SyncOperation,
+        SyncPlan,
+    )
+    from lingq_client import LingQClient  # type: ignore[no-redef]
 
 
 _LOGGER = logging.getLogger(__name__)
