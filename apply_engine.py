@@ -28,6 +28,16 @@ from lingq_client import LingQClient
 _LOGGER = logging.getLogger(__name__)
 
 
+def _is_anki_runtime() -> bool:
+    """Check if running inside Anki with collection available."""
+    try:
+        from aqt import mw
+
+        return mw is not None and mw.col is not None
+    except ImportError:
+        return False
+
+
 @dataclass
 class Checkpoint:
     run_id: str
@@ -136,6 +146,184 @@ def _hints_for_op(op: SyncOperation) -> List[Dict[str, Any]]:
     if isinstance(hints, list) and all(isinstance(x, dict) for x in hints):
         return list(hints)  # type: ignore[return-value]
     return []
+
+
+def _apply_link(op: SyncOperation) -> bool:
+    """Write LingQ PK and canonical term to Anki note fields.
+
+    Returns True if changes were made, False otherwise.
+    Raises on error.
+    """
+
+    if not _is_anki_runtime():
+        raise RuntimeError("Anki runtime required for OP_LINK")
+
+    from aqt import mw
+
+    note_id = op.anki_note_id
+    if note_id is None:
+        raise ValueError("OP_LINK missing anki_note_id")
+
+    if not isinstance(op.details, dict):
+        raise ValueError("OP_LINK missing op.details")
+
+    identity_fields = op.details.get("identity_fields", {})
+    identity_values = op.details.get("identity_values", {})
+    if not isinstance(identity_fields, dict) or not isinstance(identity_values, dict):
+        raise ValueError("OP_LINK missing identity_fields/identity_values")
+
+    pk_field = identity_fields.get("pk_field")
+    canon_field = identity_fields.get("canonical_term_field")
+    pk_value = str(identity_values.get("pk_value", "")).strip()
+    canon_value = str(identity_values.get("canonical_term_value", "")).strip()
+
+    if not isinstance(pk_field, str) or not pk_field.strip():
+        raise ValueError("OP_LINK missing identity field name: pk_field")
+    if not isinstance(canon_field, str) or not canon_field.strip():
+        raise ValueError("OP_LINK missing identity field name: canonical_term_field")
+    if not pk_value:
+        raise ValueError("OP_LINK missing identity value: pk_value")
+
+    note = mw.col.get_note(note_id)
+    model = note.note_type()
+    field_names = mw.col.models.field_names(model)
+
+    if pk_field not in field_names or canon_field not in field_names:
+        raise ValueError(f"Identity fields not in note type: {pk_field}, {canon_field}")
+
+    existing_pk = (note[pk_field] or "").strip()
+    existing_canon = (note[canon_field] or "").strip()
+
+    # Conflict check
+    if existing_pk and existing_pk != pk_value:
+        raise ValueError(
+            f"PK conflict: note has {existing_pk}, trying to set {pk_value}"
+        )
+
+    # Idempotency check
+    if existing_pk == pk_value and existing_canon == canon_value:
+        return False
+
+    # Apply changes
+    if not existing_pk:
+        note[pk_field] = pk_value
+    if existing_canon != canon_value:
+        note[canon_field] = canon_value
+
+    mw.col.update_note(note)
+    return True
+
+
+def _apply_create_anki(op: SyncOperation) -> bool:
+    """Create new Anki note from LingQ card.
+
+    Returns True if note was created, False if already exists.
+    Raises on error.
+    """
+
+    if not _is_anki_runtime():
+        raise RuntimeError("Anki runtime required for OP_CREATE_ANKI")
+
+    from aqt import mw
+
+    if not isinstance(op.details, dict):
+        raise ValueError("OP_CREATE_ANKI missing op.details")
+
+    note_type = str(op.details.get("note_type") or "").strip()
+    fields = op.details.get("fields")
+    if not note_type or not isinstance(fields, dict):
+        raise ValueError("OP_CREATE_ANKI missing note_type or fields")
+
+    identity_fields = op.details.get("identity_fields", {})
+    identity_values = op.details.get("identity_values", {})
+    if not isinstance(identity_fields, dict) or not isinstance(identity_values, dict):
+        raise ValueError("OP_CREATE_ANKI missing identity_fields/identity_values")
+
+    pk_field = identity_fields.get("pk_field")
+    pk_value = str(identity_values.get("pk_value", "")).strip()
+
+    if isinstance(pk_field, str) and pk_field.strip() and pk_value:
+        existing = mw.col.find_notes(f"{pk_field}:{pk_value}")
+        if existing:
+            return False
+
+    model = mw.col.models.by_name(note_type)
+    if not model:
+        raise ValueError(f"Note type not found: {note_type}")
+
+    model_fields = set(mw.col.models.field_names(model))
+    for fname in fields.keys():
+        if fname not in model_fields:
+            raise ValueError(f"Field {fname!r} not in note type {note_type!r}")
+
+    deck_name = str(op.details.get("deck") or "Default").strip() or "Default"
+    deck_id = mw.col.decks.id(deck_name)
+
+    note = mw.col.new_note(model)
+    for fname, value in fields.items():
+        note[fname] = str(value or "")
+
+    mw.col.add_note(note, deck_id)
+    return True
+
+
+def _tier_to_days(tier: str) -> int:
+    """Map LingQ tier to Anki interval days."""
+
+    mapping = {"new": 0, "learning": 4, "learned": 28, "known": 90}
+    return int(mapping.get(tier, 0))
+
+
+def _apply_reschedule_anki(op: SyncOperation) -> bool:
+    """Reschedule Anki card using FSRS-safe method.
+
+    Returns True if card was rescheduled, False if no change needed.
+    Raises on error.
+
+    CRITICAL: Uses set_due_date() - NEVER writes to revlog or memory_state.
+    """
+
+    if not _is_anki_runtime():
+        raise RuntimeError("Anki runtime required for OP_RESCHEDULE_ANKI")
+
+    from aqt import mw
+
+    note_id = op.anki_note_id
+    if note_id is None:
+        raise ValueError("OP_RESCHEDULE_ANKI missing anki_note_id")
+
+    if not isinstance(op.details, dict):
+        raise ValueError("OP_RESCHEDULE_ANKI missing op.details")
+
+    tier = str(op.details.get("target_tier") or "").strip()
+    if tier not in {"new", "learning", "learned", "known"}:
+        raise ValueError(f"Invalid target_tier: {tier}")
+
+    note = mw.col.get_note(note_id)
+    cards = note.cards()
+    if not cards:
+        raise ValueError("Note has no cards")
+
+    # Select primary card (first by ordinal)
+    card = min(cards, key=lambda c: c.ord)
+    target_days = _tier_to_days(tier)
+
+    # Handle "new" tier specially
+    if tier == "new":
+        if getattr(card, "queue", None) == 0:
+            return False
+        mw.col.sched.forget_cards([card.id])
+        return True
+
+    # Idempotency check
+    if getattr(card, "queue", None) == 2 and int(getattr(card, "ivl", 0) or 0) == int(
+        target_days
+    ):
+        return False
+
+    # FSRS-safe rescheduling
+    mw.col.sched.set_due_date([card.id], str(target_days))
+    return True
 
 
 def _ordered_operations(plan: SyncPlan) -> List[Tuple[int, SyncOperation]]:
@@ -255,6 +443,30 @@ def apply_sync_plan(
             elif op.op_type == OP_UPDATE_STATUS:
                 _apply_update_status(op, client)
                 result.success_count += 1
+                checkpoint.completed_ops.append(op_id)
+                completed.add(op_id)
+            elif op.op_type == OP_LINK and _is_anki_runtime():
+                changed = _apply_link(op)
+                if changed:
+                    result.success_count += 1
+                else:
+                    result.skipped_count += 1
+                checkpoint.completed_ops.append(op_id)
+                completed.add(op_id)
+            elif op.op_type == OP_CREATE_ANKI and _is_anki_runtime():
+                created = _apply_create_anki(op)
+                if created:
+                    result.success_count += 1
+                else:
+                    result.skipped_count += 1
+                checkpoint.completed_ops.append(op_id)
+                completed.add(op_id)
+            elif op.op_type == OP_RESCHEDULE_ANKI and _is_anki_runtime():
+                changed = _apply_reschedule_anki(op)
+                if changed:
+                    result.success_count += 1
+                else:
+                    result.skipped_count += 1
                 checkpoint.completed_ops.append(op_id)
                 completed.add(op_id)
             elif op.op_type in {OP_LINK, OP_CREATE_ANKI, OP_RESCHEDULE_ANKI}:
