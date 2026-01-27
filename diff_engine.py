@@ -7,10 +7,22 @@ try:
     from .hint_reconciliation import build_hints_payload, find_missing_hints
     from .matching import normalize_text
     from .progress_sync import compare_progress, has_polysemy, lingq_status_to_tier
+    from .run_options import (  # type: ignore
+        AmbiguousMatchPolicy,
+        RunOptions,
+        SchedulingWritePolicy,
+        TranslationAggregationPolicy,
+    )
 except ImportError:
     from hint_reconciliation import build_hints_payload, find_missing_hints  # type: ignore[no-redef]
     from matching import normalize_text  # type: ignore[no-redef]
     from progress_sync import compare_progress, has_polysemy, lingq_status_to_tier  # type: ignore[no-redef]
+    from run_options import (  # type: ignore[no-redef]
+        AmbiguousMatchPolicy,
+        RunOptions,
+        SchedulingWritePolicy,
+        TranslationAggregationPolicy,
+    )
 
 
 OP_CREATE_LINGQ = "create_lingq"  # create new LingQ card from Anki
@@ -54,6 +66,7 @@ def compute_sync_plan(
     lingq_cards: List[Dict],
     profile,  # Profile dataclass
     meaning_locale: str,
+    run_options: Optional[RunOptions] = None,
 ) -> SyncPlan:
     plan = SyncPlan()
     # Optional integration: attach profile name for apply_engine checkpoints.
@@ -62,6 +75,8 @@ def compute_sync_plan(
     pk_field = profile.lingq_to_anki.identity_fields.pk_field
     canonical_term_field = profile.lingq_to_anki.identity_fields.canonical_term_field
     lingq_language = profile.lingq_language
+
+    enable_sched = _effective_enable_scheduling_writes(profile, run_options)
 
     # --- Load LSS (injected or store-backed) ---
     lss = _load_lss(profile)
@@ -161,7 +176,14 @@ def compute_sync_plan(
 
             # No OP_LINK needed if already linked by PK.
             _emit_update_ops_for_linked_pair(
-                plan, note, card, lss, profile, meaning_locale
+                plan,
+                note,
+                card,
+                lss,
+                profile,
+                meaning_locale,
+                run_options,
+                enable_sched,
             )
             continue
 
@@ -175,17 +197,54 @@ def compute_sync_plan(
             )
             continue
         if len(translations) > 1:
-            plan.operations.append(
-                _op_conflict(
-                    anki_note_id=note_id,
-                    lingq_pk=None,
-                    term=term,
-                    conflict_type="anki_polysemy_needs_policy",
-                    recommended_action="choose_aggregation_policy_or_select_single_translation",
-                    details={"translations": list(translations)},
+            if run_options is None:
+                plan.operations.append(
+                    _op_conflict(
+                        anki_note_id=note_id,
+                        lingq_pk=None,
+                        term=term,
+                        conflict_type="anki_polysemy_needs_policy",
+                        recommended_action="choose_aggregation_policy_or_select_single_translation",
+                        details={"translations": _sorted_translations(translations)},
+                    )
                 )
+                continue
+
+            policy = getattr(
+                run_options,
+                "translation_aggregation_policy",
+                TranslationAggregationPolicy.UNSET,
             )
-            continue
+            selected = _select_translation_by_policy(translations, policy)
+            if selected is None:
+                if policy in {
+                    TranslationAggregationPolicy.SKIP,
+                }:
+                    plan.operations.append(
+                        _op_skip(
+                            note_id,
+                            None,
+                            term,
+                            reason="translation_aggregation_policy_skip",
+                        )
+                    )
+                else:
+                    plan.operations.append(
+                        _op_conflict(
+                            anki_note_id=note_id,
+                            lingq_pk=None,
+                            term=term,
+                            conflict_type="anki_polysemy_needs_policy",
+                            recommended_action="choose_aggregation_policy_or_select_single_translation",
+                            details={
+                                "translations": _sorted_translations(translations)
+                            },
+                        )
+                    )
+                continue
+
+            translations = [selected]
+            translation_norms = [normalize_text(selected)]
 
         candidate_cards = lingq_by_term_norm.get(term_norm, [])
         matches = _filter_lingq_by_translation(
@@ -238,20 +297,144 @@ def compute_sync_plan(
             )
 
             _emit_update_ops_for_linked_pair(
-                plan, note, card, lss, profile, meaning_locale
+                plan,
+                note,
+                card,
+                lss,
+                profile,
+                meaning_locale,
+                run_options,
+                enable_sched,
             )
             continue
 
         if len(matches) == 0:
-            # Create LingQ card from Anki (only if single translation).
+            # Create LingQ card from Anki only if we have evidence of Anki progress.
+            # Rationale: importing/creating a large Anki deck should not spam-create
+            # LingQ cards until the user has actually started reviewing.
+            cards_raw = (note or {}).get("cards")
+            if isinstance(cards_raw, list) and not _anki_has_reviews(note):
+                plan.operations.append(
+                    _op_skip(
+                        note_id,
+                        None,
+                        term,
+                        reason="anki_unreviewed_skip_create_lingq",
+                    )
+                )
+                continue
+
+            # Optional: include example usage/source text if configured.
+            fragment_val: Optional[str] = None
+            try:
+                frag_field = getattr(profile.anki_to_lingq, "fragment_field", None)
+                if isinstance(frag_field, str) and frag_field.strip():
+                    fv = fields.get(frag_field.strip())
+                    if isinstance(fv, str) and fv.strip():
+                        fragment_val = fv.strip()
+            except Exception:
+                fragment_val = None
+
             plan.operations.append(
                 _op_create_lingq(
-                    note_id, term, translations, lingq_language, meaning_locale
+                    note_id,
+                    term,
+                    translations,
+                    lingq_language,
+                    meaning_locale,
+                    fragment=fragment_val,
+                    pk_field=pk_field,
+                    canonical_term_field=canonical_term_field,
+                    desired_status=_map_anki_progress_to_lingq_status(
+                        note, current_status=0
+                    ),
                 )
             )
             continue
 
         # len(matches) > 1
+        if run_options is None:
+            plan.operations.append(
+                _op_conflict(
+                    anki_note_id=note_id,
+                    lingq_pk=None,
+                    term=term,
+                    conflict_type="ambiguous_lingq_match",
+                    recommended_action="user_select_lingq_pk",
+                    details={"candidates": _sorted_candidates(matches, meaning_locale)},
+                )
+            )
+            continue
+
+        amb_policy = getattr(
+            run_options,
+            "ambiguous_match_policy",
+            AmbiguousMatchPolicy.UNSET,
+        )
+
+        if amb_policy in {
+            AmbiguousMatchPolicy.SKIP,
+            AmbiguousMatchPolicy.CONSERVATIVE_SKIP,
+        }:
+            plan.operations.append(
+                _op_skip(
+                    note_id,
+                    None,
+                    term,
+                    reason=f"ambiguous_match_policy_{str(amb_policy.value).lower()}",
+                )
+            )
+            continue
+
+        if amb_policy == AmbiguousMatchPolicy.AGGRESSIVE_LINK_FIRST:
+            picked = _pick_first_lingq_candidate(matches, linked_lingq_pks)
+            if picked is None:
+                plan.operations.append(
+                    _op_conflict(
+                        anki_note_id=note_id,
+                        lingq_pk=None,
+                        term=term,
+                        conflict_type="ambiguous_lingq_match",
+                        recommended_action="multiple_anki_notes_match_same_lingq",
+                        details={
+                            "candidates": _sorted_candidates(matches, meaning_locale)
+                        },
+                    )
+                )
+                continue
+            card = picked
+            pk = _parse_int((card or {}).get("pk"))
+            if pk is None:
+                plan.operations.append(
+                    _op_skip(note_id, None, term, reason="invalid_payload")
+                )
+                continue
+            linked_lingq_pks.add(pk)
+            linked_anki_note_ids.add(note_id)
+            used_pk_by_anki_note[note_id] = pk
+            plan.operations.append(
+                _op_link(
+                    note_id,
+                    pk,
+                    term,
+                    pk_field,
+                    canonical_term_field,
+                    str((card or {}).get("term") or ""),
+                )
+            )
+            _emit_update_ops_for_linked_pair(
+                plan,
+                note,
+                card,
+                lss,
+                profile,
+                meaning_locale,
+                run_options,
+                enable_sched,
+            )
+            continue
+
+        # ASK / UNSET -> conflict
         plan.operations.append(
             _op_conflict(
                 anki_note_id=note_id,
@@ -259,11 +442,7 @@ def compute_sync_plan(
                 term=term,
                 conflict_type="ambiguous_lingq_match",
                 recommended_action="user_select_lingq_pk",
-                details={
-                    "candidates": [
-                        _candidate_summary(c, meaning_locale) for c in matches
-                    ]
-                },
+                details={"candidates": _sorted_candidates(matches, meaning_locale)},
             )
         )
 
@@ -299,6 +478,20 @@ def compute_sync_plan(
                 fields, profile
             )
             if len(translation_norms) != 1:
+                if run_options is None:
+                    continue
+                if len(_translations) <= 1:
+                    continue
+                agg = getattr(
+                    run_options,
+                    "translation_aggregation_policy",
+                    TranslationAggregationPolicy.UNSET,
+                )
+                selected = _select_translation_by_policy(_translations, agg)
+                if selected is None:
+                    continue
+                if normalize_text(selected) == primary_translation_norm:
+                    matches.append(note)
                 continue
             if translation_norms[0] == primary_translation_norm:
                 matches.append(note)
@@ -320,11 +513,86 @@ def compute_sync_plan(
                 linked_lingq_pks.add(pk)
                 linked_anki_note_ids.add(note_id)
                 _emit_update_ops_for_linked_pair(
-                    plan, note, card, lss, profile, meaning_locale
+                    plan,
+                    note,
+                    card,
+                    lss,
+                    profile,
+                    meaning_locale,
+                    run_options,
+                    enable_sched,
                 )
                 continue
 
         if len(matches) > 1:
+            if run_options is None:
+                plan.operations.append(
+                    _op_conflict(
+                        anki_note_id=None,
+                        lingq_pk=pk,
+                        term=term,
+                        conflict_type="ambiguous_lingq_match",
+                        recommended_action="multiple_anki_notes_match_same_lingq",
+                        details={
+                            "anki_candidates": _sorted_anki_candidate_ids(matches)
+                        },
+                    )
+                )
+                continue
+
+            amb_policy = getattr(
+                run_options,
+                "ambiguous_match_policy",
+                AmbiguousMatchPolicy.UNSET,
+            )
+
+            if amb_policy in {
+                AmbiguousMatchPolicy.SKIP,
+                AmbiguousMatchPolicy.CONSERVATIVE_SKIP,
+            }:
+                plan.operations.append(
+                    _op_skip(
+                        None,
+                        pk,
+                        term,
+                        reason=f"ambiguous_match_policy_{str(amb_policy.value).lower()}",
+                    )
+                )
+                continue
+
+            if amb_policy == AmbiguousMatchPolicy.AGGRESSIVE_LINK_FIRST:
+                picked_note = _pick_first_anki_candidate(matches)
+                note_id = _parse_int((picked_note or {}).get("note_id"))
+                if note_id is None:
+                    plan.operations.append(
+                        _op_skip(None, pk, term, reason="invalid_payload")
+                    )
+                    continue
+                plan.operations.append(
+                    _op_link(
+                        note_id,
+                        pk,
+                        term,
+                        pk_field,
+                        canonical_term_field,
+                        str((card or {}).get("term") or ""),
+                    )
+                )
+                linked_lingq_pks.add(pk)
+                linked_anki_note_ids.add(note_id)
+                _emit_update_ops_for_linked_pair(
+                    plan,
+                    picked_note,
+                    card,
+                    lss,
+                    profile,
+                    meaning_locale,
+                    run_options,
+                    enable_sched,
+                )
+                continue
+
+            # ASK / UNSET
             plan.operations.append(
                 _op_conflict(
                     anki_note_id=None,
@@ -332,11 +600,7 @@ def compute_sync_plan(
                     term=term,
                     conflict_type="ambiguous_lingq_match",
                     recommended_action="multiple_anki_notes_match_same_lingq",
-                    details={
-                        "anki_candidates": [
-                            int((n or {}).get("note_id") or 0) for n in matches
-                        ]
-                    },
+                    details={"anki_candidates": _sorted_anki_candidate_ids(matches)},
                 )
             )
             continue
@@ -355,6 +619,82 @@ def _load_lss(profile: Any) -> Dict[Any, Any]:
         return injected
     # fallback: lss_store.load(profile.name)
     return {}
+
+
+def _effective_enable_scheduling_writes(
+    profile: Any, run_options: Optional[RunOptions]
+) -> bool:
+    base = bool(getattr(profile, "enable_scheduling_writes", False))
+    if run_options is None:
+        return base
+    pol = getattr(run_options, "scheduling_write_policy", SchedulingWritePolicy.UNSET)
+    if pol == SchedulingWritePolicy.FORCE_OFF:
+        return False
+    if pol == SchedulingWritePolicy.FORCE_ON:
+        return True
+    # INHERIT_PROFILE / UNSET
+    return base
+
+
+def _sorted_translations(translations: List[str]) -> List[str]:
+    uniq = list(dict.fromkeys([t for t in translations if normalize_text(t)]))
+    return sorted(uniq, key=lambda t: normalize_text(t))
+
+
+def _select_translation_by_policy(
+    translations: List[str], policy: TranslationAggregationPolicy
+) -> Optional[str]:
+    items = _sorted_translations(translations)
+    if not items:
+        return None
+    if policy == TranslationAggregationPolicy.MIN:
+        return items[0]
+    if policy == TranslationAggregationPolicy.MAX:
+        return items[-1]
+    if policy == TranslationAggregationPolicy.AVG:
+        return items[len(items) // 2]
+    # ASK / SKIP / UNSET
+    return None
+
+
+def _sorted_candidates(
+    cards: List[Dict[str, Any]], meaning_locale: str
+) -> List[Dict[str, Any]]:
+    out = [_candidate_summary(c, meaning_locale) for c in cards]
+    for d in out:
+        hints = d.get("hints")
+        if isinstance(hints, list):
+            d["hints"] = sorted(
+                [str(x) for x in hints], key=lambda x: normalize_text(x)
+            )
+    out.sort(key=lambda d: int(d.get("pk") or 0))
+    return out
+
+
+def _sorted_anki_candidate_ids(notes: List[Dict[str, Any]]) -> List[int]:
+    ids: List[int] = []
+    for n in notes:
+        note_id = _parse_int((n or {}).get("note_id"))
+        if note_id is not None:
+            ids.append(note_id)
+    return sorted(ids)
+
+
+def _pick_first_lingq_candidate(
+    cards: List[Dict[str, Any]], linked_lingq_pks: set[int]
+) -> Optional[Dict[str, Any]]:
+    for c in sorted(cards, key=lambda c: int((c or {}).get("pk") or 0)):
+        pk = _parse_int((c or {}).get("pk"))
+        if pk is None:
+            continue
+        if pk in linked_lingq_pks:
+            continue
+        return c
+    return None
+
+
+def _pick_first_anki_candidate(notes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return sorted(notes, key=lambda n: int((n or {}).get("note_id") or 0))[0]
 
 
 def _parse_int(value: Any) -> Optional[int]:
@@ -452,6 +792,8 @@ def _emit_update_ops_for_linked_pair(
     lss: Dict[Any, Any],
     profile: Any,
     meaning_locale: str,
+    run_options: Optional[RunOptions],
+    enable_scheduling_writes: bool,
 ) -> None:
     note_id = _parse_int((note or {}).get("note_id"))
     pk = _parse_int((card or {}).get("pk"))
@@ -469,33 +811,72 @@ def _emit_update_ops_for_linked_pair(
         cast(Dict[str, Any], fields_raw) if isinstance(fields_raw, dict) else {}
     )
     translations, _translation_norms = _extract_anki_translations(fields, profile)
+    cards_raw = (note or {}).get("cards")
+    anki_has_reviews = _anki_has_reviews(note)
     lingq_hints_raw = (card or {}).get("hints")
     lingq_hints_list = lingq_hints_raw if isinstance(lingq_hints_raw, list) else []
     lingq_hints: List[Dict[str, Any]] = [
         h for h in lingq_hints_list if isinstance(h, dict)
     ]
-    missing = find_missing_hints(translations, lingq_hints, meaning_locale)
 
-    if missing:
-        new_payload = build_hints_payload(lingq_hints, missing, meaning_locale)
-        if not _hints_payload_equal(new_payload, lingq_hints):
-            plan.operations.append(
-                SyncOperation(
-                    op_type=OP_UPDATE_HINTS,
-                    anki_note_id=note_id,
-                    lingq_pk=pk,
-                    term=term,
-                    details={
-                        "lingq_language": profile.lingq_language,
-                        "hints": new_payload,
-                        "reason": "anki_translation_missing_in_lingq",
-                    },
-                )
+    missing_all = find_missing_hints(translations, lingq_hints, meaning_locale)
+    if missing_all:
+        if run_options is None or len(translations) <= 1:
+            missing = missing_all
+        else:
+            agg = getattr(
+                run_options,
+                "translation_aggregation_policy",
+                TranslationAggregationPolicy.UNSET,
             )
+            selected = _select_translation_by_policy(translations, agg)
+            if agg == TranslationAggregationPolicy.SKIP:
+                plan.operations.append(
+                    _op_skip(
+                        note_id,
+                        pk,
+                        term,
+                        reason="translation_aggregation_policy_skip",
+                    )
+                )
+                missing = []
+            elif selected is None:
+                plan.operations.append(
+                    _op_conflict(
+                        anki_note_id=note_id,
+                        lingq_pk=pk,
+                        term=term,
+                        conflict_type="anki_polysemy_needs_policy",
+                        recommended_action="choose_aggregation_policy_or_select_single_translation",
+                        details={"translations": _sorted_translations(translations)},
+                    )
+                )
+                missing = []
+            else:
+                missing = find_missing_hints([selected], lingq_hints, meaning_locale)
+
+        # Only push Anki->LingQ hint updates when there is evidence of Anki progress.
+        # If cards are unavailable in the snapshot, keep legacy behavior.
+        if missing and (not isinstance(cards_raw, list) or anki_has_reviews):
+            new_payload = build_hints_payload(lingq_hints, missing, meaning_locale)
+            if not _hints_payload_equal(new_payload, lingq_hints):
+                plan.operations.append(
+                    SyncOperation(
+                        op_type=OP_UPDATE_HINTS,
+                        anki_note_id=note_id,
+                        lingq_pk=pk,
+                        term=term,
+                        details={
+                            "lingq_language": profile.lingq_language,
+                            "hints": new_payload,
+                            "reason": "anki_translation_missing_in_lingq",
+                        },
+                    )
+                )
 
     # --- Progress: choose direction using progress_sync.compare_progress ---
-    enable_sched = bool(getattr(profile, "enable_scheduling_writes", False))
-    anki_has_reviews = _anki_has_reviews(note)
+    enable_sched = bool(enable_scheduling_writes)
+    # anki_has_reviews computed above (and used for gating Anki->LingQ hint updates).
     lingq_status = int((card or {}).get("status") or 0)
     poly = has_polysemy(lingq_hints, meaning_locale)
     comp = compare_progress(
@@ -653,16 +1034,45 @@ def _op_create_lingq(
     translations: List[str],
     lingq_language: str,
     meaning_locale: str,
+    fragment: Optional[str] = None,
+    *,
+    pk_field: Optional[str] = None,
+    canonical_term_field: Optional[str] = None,
+    desired_status: Optional[int] = None,
 ) -> SyncOperation:
     hints = [
         {"locale": meaning_locale, "text": translations[0]}
     ]  # single translation only
+    details: Dict[str, Any] = {
+        "lingq_language": lingq_language,
+        "hints": hints,
+        "source": "anki",
+    }
+    frag = (fragment or "").strip()
+    if frag:
+        details["fragment"] = frag
+
+    # Allow apply_engine to backfill identity fields after create.
+    if (
+        isinstance(pk_field, str)
+        and pk_field.strip()
+        and isinstance(canonical_term_field, str)
+        and canonical_term_field.strip()
+    ):
+        details["identity_fields"] = {
+            "pk_field": pk_field.strip(),
+            "canonical_term_field": canonical_term_field.strip(),
+        }
+        details["identity_values"] = {"canonical_term_value": term}
+
+    if isinstance(desired_status, int):
+        details["desired_status"] = int(desired_status)
     return SyncOperation(
         op_type=OP_CREATE_LINGQ,
         anki_note_id=note_id,
         lingq_pk=None,
         term=term,
-        details={"lingq_language": lingq_language, "hints": hints, "source": "anki"},
+        details=details,
     )
 
 
@@ -685,24 +1095,31 @@ def _op_create_anki_from_lingq(
     if pk is not None:
         fields_out[pk_field] = str(pk)
     fields_out[canon_field] = term
+
+    details: Dict[str, Any] = {
+        "note_type": profile.lingq_to_anki.note_type,
+        "fields": fields_out,
+        "identity_fields": {
+            "pk_field": pk_field,
+            "canonical_term_field": canon_field,
+        },
+        "identity_values": {
+            "pk_value": str(pk) if pk is not None else "",
+            "canonical_term_value": term,
+        },
+        "source": "lingq",
+    }
+
+    deck_name = getattr(profile.lingq_to_anki, "deck_name", None)
+    if isinstance(deck_name, str) and deck_name.strip():
+        details["deck"] = deck_name.strip()
+
     return SyncOperation(
         op_type=OP_CREATE_ANKI,
         anki_note_id=None,
         lingq_pk=pk,
         term=term,
-        details={
-            "note_type": profile.lingq_to_anki.note_type,
-            "fields": fields_out,
-            "identity_fields": {
-                "pk_field": pk_field,
-                "canonical_term_field": canon_field,
-            },
-            "identity_values": {
-                "pk_value": str(pk) if pk is not None else "",
-                "canonical_term_value": term,
-            },
-            "source": "lingq",
-        },
+        details=details,
     )
 
 

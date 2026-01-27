@@ -27,7 +27,7 @@ def _make_profile() -> Profile:
             ),
         ),
         anki_to_lingq=AnkiToLingqMapping(
-            term_field="Front", translation_fields=["Back"]
+            term_field="Front", translation_fields=["Back"], fragment_field=None
         ),
         enable_scheduling_writes=False,
     )
@@ -100,6 +100,50 @@ def test_compute_sync_plan_empty_inputs_produces_empty_plan():
 
     assert plan.operations == []
     assert plan.count_by_type() == {}
+
+
+def test_compute_sync_plan_unreviewed_unlinked_anki_note_skips_create_lingq():
+    profile = _make_profile()
+
+    anki_notes = [
+        {
+            "note_id": 1,
+            "fields": {"Front": "hello", "Back": "hola", "LingQ_PK": ""},
+            "cards": [{"reps": 0, "ivl": 0, "queue": 0, "ord": 0, "id": 123}],
+        }
+    ]
+    lingq_cards = []
+
+    plan = compute_sync_plan(anki_notes, lingq_cards, profile, profile.meaning_locale)
+    counts = plan.count_by_type()
+
+    assert counts.get("create_lingq", 0) == 0
+    assert counts.get("skip", 0) == 1
+    skips = plan.get_skips()
+    assert len(skips) == 1
+    assert skips[0].details.get("reason") == "anki_unreviewed_skip_create_lingq"
+
+
+def test_compute_sync_plan_create_lingq_includes_fragment_when_configured():
+    profile = _make_profile()
+    profile.anki_to_lingq.fragment_field = "Example"
+
+    anki_notes = [
+        {
+            "note_id": 1,
+            "fields": {
+                "Front": "hello",
+                "Back": "hola",
+                "Example": "Hej, jag heter Mirza.",
+            },
+            "cards": [{"reps": 1, "ivl": 0, "queue": 2, "ord": 0, "id": 123}],
+        }
+    ]
+
+    plan = compute_sync_plan(anki_notes, [], profile, profile.meaning_locale)
+    create_ops = [op for op in plan.operations if op.op_type == "create_lingq"]
+    assert len(create_ops) == 1
+    assert create_ops[0].details.get("fragment") == "Hej, jag heter Mirza."
 
 
 def test_compute_sync_plan_duplicate_pk_conflict():
