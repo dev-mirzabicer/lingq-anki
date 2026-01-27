@@ -21,6 +21,7 @@ try:
         TranslationAggregationPolicy,
         SchedulingWritePolicy,
         RunOptions,
+        ProgressAuthorityPolicy,
         validate_run_options,
         run_options_to_dict,
         dict_to_run_options,
@@ -31,6 +32,7 @@ except ImportError:
         TranslationAggregationPolicy,
         SchedulingWritePolicy,
         RunOptions,
+        ProgressAuthorityPolicy,
         validate_run_options,
         run_options_to_dict,
         dict_to_run_options,
@@ -398,6 +400,28 @@ class SyncDialog(QDialog):
         )
         options_layout.addLayout(scheduling_row)
 
+        self.progress_combo = QComboBox()
+        self.progress_combo.setStyleSheet(dropdown_style)
+        self.progress_combo.addItem(
+            "Automatic (recommended)", ProgressAuthorityPolicy.AUTOMATIC
+        )
+        self.progress_combo.addItem(
+            "Prefer Anki (ignore LingQ review progress)",
+            ProgressAuthorityPolicy.PREFER_ANKI,
+        )
+        self.progress_combo.addItem(
+            "Prefer LingQ (can reschedule even if Anki reviewed)",
+            ProgressAuthorityPolicy.PREFER_LINGQ,
+        )
+        self.progress_combo.currentIndexChanged.connect(self._on_run_option_changed)
+
+        progress_row = self._create_option_row(
+            "Progress authority:",
+            "Which app should win for progress decisions when they disagree",
+            self.progress_combo,
+        )
+        options_layout.addLayout(progress_row)
+
         self.run_options_warning = QLabel("")
         self.run_options_warning.setStyleSheet(
             "color: #ef4444; font-size: 11px; font-weight: 500; background: transparent; border: none;"
@@ -451,6 +475,7 @@ class SyncDialog(QDialog):
             ambiguous_match_policy=AmbiguousMatchPolicy.ASK,
             translation_aggregation_policy=TranslationAggregationPolicy.ASK,
             scheduling_write_policy=SchedulingWritePolicy.INHERIT_PROFILE,
+            progress_authority_policy=ProgressAuthorityPolicy.AUTOMATIC,
         )
 
     def _on_run_option_changed(self) -> None:
@@ -458,6 +483,7 @@ class SyncDialog(QDialog):
             ambiguous_match_policy=self.ambiguous_combo.currentData(),
             translation_aggregation_policy=self.aggregation_combo.currentData(),
             scheduling_write_policy=self.scheduling_combo.currentData(),
+            progress_authority_policy=self.progress_combo.currentData(),
         )
         self._update_button_states()
         self._save_run_options_for_profile()
@@ -541,6 +567,9 @@ class SyncDialog(QDialog):
         )
         self._set_combo_by_data(
             self.scheduling_combo, self._run_options.scheduling_write_policy
+        )
+        self._set_combo_by_data(
+            self.progress_combo, self._run_options.progress_authority_policy
         )
 
     def _set_combo_by_data(self, combo: QComboBox, value) -> None:

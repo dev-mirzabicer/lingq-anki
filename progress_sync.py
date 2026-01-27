@@ -133,6 +133,7 @@ def compare_progress(
     meaning_locale: str,
     anki_has_reviews: bool,
     enable_scheduling_writes: bool,
+    progress_authority_policy: str = "AUTOMATIC",
 ) -> ProgressComparison:
     """Compare coarse progress and decide which direction should write.
 
@@ -154,6 +155,34 @@ def compare_progress(
             should_sync_to_anki=False,
             lingq_tier=tier,
             reason="scheduling_writes_disabled",
+        )
+
+    # Authority override: if user prefers Anki and Anki has reviews,
+    # never reschedule from LingQ; only allow Anki -> LingQ.
+    auth = str(progress_authority_policy or "AUTOMATIC")
+    if bool(anki_has_reviews) and auth == "PREFER_ANKI":
+        return ProgressComparison(
+            should_sync_to_lingq=True,
+            should_sync_to_anki=False,
+            lingq_tier=tier,
+            reason="anki_priority_forced",
+        )
+
+    # Authority override: if user prefers LingQ and LingQ shows progress,
+    # allow LingQ -> Anki even if Anki has reviews (polysemy still blocks).
+    if auth == "PREFER_LINGQ" and tier != "new":
+        if poly:
+            return ProgressComparison(
+                should_sync_to_lingq=False,
+                should_sync_to_anki=False,
+                lingq_tier=tier,
+                reason="polysemy_skip_lingq_to_anki",
+            )
+        return ProgressComparison(
+            should_sync_to_lingq=False,
+            should_sync_to_anki=True,
+            lingq_tier=tier,
+            reason="lingq_priority_forced",
         )
 
     # If Anki has reviews but LingQ is still 'new', treat this as Anki-leading.

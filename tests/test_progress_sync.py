@@ -74,6 +74,7 @@ def test_compare_progress_scheduling_disabled():
         meaning_locale="en",
         anki_has_reviews=True,
         enable_scheduling_writes=False,
+        progress_authority_policy="AUTOMATIC",
     )
     assert result.should_sync_to_lingq is False
     assert result.should_sync_to_anki is False
@@ -87,6 +88,7 @@ def test_compare_progress_anki_leads():
         meaning_locale="en",
         anki_has_reviews=True,
         enable_scheduling_writes=True,
+        progress_authority_policy="AUTOMATIC",
     )
     assert result.should_sync_to_lingq is True
     assert result.should_sync_to_anki is False
@@ -103,6 +105,21 @@ def test_compare_progress_polysemy_blocks():
         meaning_locale="en",
         anki_has_reviews=False,
         enable_scheduling_writes=True,
+        progress_authority_policy="AUTOMATIC",
     )
     assert result.should_sync_to_anki is False
     assert "polysemy" in result.reason
+
+
+def test_compare_progress_prefer_anki_forces_anki_to_lingq_when_reviewed():
+    result = compare_progress(
+        lingq_status=3,
+        lingq_hints=[],
+        meaning_locale="en",
+        anki_has_reviews=True,
+        enable_scheduling_writes=True,
+        progress_authority_policy="PREFER_ANKI",
+    )
+    assert result.should_sync_to_lingq is True
+    assert result.should_sync_to_anki is False
+    assert "anki_priority" in result.reason
