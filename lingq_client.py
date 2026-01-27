@@ -102,9 +102,19 @@ class LingQClient:
         return out
 
     def create_card(
-        self, language: str, term: str, hints: Sequence[HintCreate]
+        self,
+        language: str,
+        term: str,
+        hints: Sequence[HintCreate],
+        *,
+        fragment: Optional[str] = None,
     ) -> Card:
-        body = {"term": term, "hints": list(hints)}
+        body: Dict[str, Any] = {"term": term, "hints": list(hints)}
+        frag = (fragment or "").strip()
+        if frag:
+            # LingQ supports setting fragment on create (POST). Patch support
+            # is not reliable, so we only send it on create.
+            body["fragment"] = frag
         url = self._make_url(f"/v3/{language}/cards/", None)
         payload = self._request_json("POST", url, body)
         if not isinstance(payload, dict):
