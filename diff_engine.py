@@ -885,6 +885,11 @@ def _emit_update_ops_for_linked_pair(
         meaning_locale=meaning_locale,
         anki_has_reviews=anki_has_reviews,
         enable_scheduling_writes=enable_sched,
+        progress_authority_policy=getattr(
+            run_options, "progress_authority_policy", "AUTOMATIC"
+        )
+        if run_options is not None
+        else "AUTOMATIC",
     )
 
     if not enable_sched:
@@ -897,7 +902,13 @@ def _emit_update_ops_for_linked_pair(
     if comp.should_sync_to_lingq:
         # Determine desired LingQ status from Anki (coarse mapping).
         desired_status = _map_anki_progress_to_lingq_status(
-            note, current_status=lingq_status
+            note,
+            current_status=lingq_status,
+            allow_decrease=(
+                run_options is not None
+                and getattr(run_options, "progress_authority_policy", "AUTOMATIC")
+                == "PREFER_ANKI"
+            ),
         )
         if desired_status != lingq_status:
             plan.operations.append(
@@ -955,34 +966,87 @@ def _anki_has_reviews(note: Dict[str, Any]) -> bool:
 
 
 def _map_anki_progress_to_lingq_status(
-    note: Dict[str, Any], current_status: int
+    note: Dict[str, Any], current_status: int, *, allow_decrease: bool = False
 ) -> int:
-    # Coarse, deterministic mapping; tune later.
-    # Never decrease LingQ status here.
-    reps = 0
-    max_ivl = 0
+    """Map Anki scheduling state to a LingQ status (0-4).
+
+    Two modes:
+    - allow_decrease=False (default): only increase LingQ status (never decrease).
+      This is a conservative mode for typical users.
+    - allow_decrease=True: allow status to go down when Anki indicates forgetting
+      (e.g. card moved back to learning/relearning).
+
+    Note: This is a coarse deterministic mapping, not a FSRS parameter fit.
+    """
+
     cards_raw = (note or {}).get("cards")
     cards = cards_raw if isinstance(cards_raw, list) else []
+
+    # Choose a primary card deterministically (lowest ord). Most note types are single-card.
+    primary: Optional[Dict[str, Any]] = None
     for c in cards:
         if not isinstance(c, dict):
             continue
-        r = c.get("reps")
-        if isinstance(r, int) and r > reps:
-            reps = r
-        ivl = c.get("ivl")
-        if isinstance(ivl, int) and ivl > max_ivl:
-            max_ivl = ivl
+        if primary is None:
+            primary = c
+            continue
+        try:
+            if int(c.get("ord") or 0) < int(primary.get("ord") or 0):
+                primary = c
+        except Exception:
+            continue
 
-    desired = current_status
-    if reps >= 1:
-        desired = max(desired, 1)
-    if reps >= 3:
-        desired = max(desired, 2)
-    if max_ivl >= 21:
-        desired = max(desired, 3)
-    if max_ivl >= 90:
-        desired = max(desired, 4)
-    return max(0, min(4, int(desired)))
+    if not allow_decrease:
+        reps = 0
+        max_ivl = 0
+        for c in cards:
+            if not isinstance(c, dict):
+                continue
+            r = c.get("reps")
+            if isinstance(r, int) and r > reps:
+                reps = r
+            ivl = c.get("ivl")
+            if isinstance(ivl, int) and ivl > max_ivl:
+                max_ivl = ivl
+
+        desired = current_status
+        if reps >= 1:
+            desired = max(desired, 1)
+        if reps >= 3:
+            desired = max(desired, 2)
+        if max_ivl >= 21:
+            desired = max(desired, 3)
+        if max_ivl >= 90:
+            desired = max(desired, 4)
+        return max(0, min(4, int(desired)))
+
+    # allow_decrease=True: base status on the primary card's current state.
+    if not isinstance(primary, dict):
+        return max(0, min(4, int(current_status)))
+
+    reps = primary.get("reps")
+    ivl = primary.get("ivl")
+    queue = primary.get("queue")
+    reps_i = int(reps) if isinstance(reps, int) else 0
+    ivl_i = int(ivl) if isinstance(ivl, int) else 0
+    queue_i = int(queue) if isinstance(queue, int) else -1
+
+    # Never drop back to status=0 if Anki has any review history.
+    if reps_i <= 0:
+        return 0
+
+    # If card is currently in learning/relearning, treat as low mastery.
+    if queue_i in {1, 3}:
+        return 1
+
+    # If in review, use interval as a stability proxy.
+    if ivl_i >= 90:
+        return 4
+    if ivl_i >= 21:
+        return 3
+    if ivl_i >= 7:
+        return 2
+    return 1
 
 
 def _hints_payload_equal(a: List[Dict[str, Any]], b: List[Dict[str, Any]]) -> bool:

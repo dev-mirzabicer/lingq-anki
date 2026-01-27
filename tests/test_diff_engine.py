@@ -11,6 +11,13 @@ sys.modules.setdefault("aqt.gui_hooks", mock_aqt.gui_hooks)
 
 from config_model import AnkiToLingqMapping, IdentityFields, LingqToAnkiMapping, Profile
 from diff_engine import compute_sync_plan
+from run_options import (
+    AmbiguousMatchPolicy,
+    ProgressAuthorityPolicy,
+    RunOptions,
+    SchedulingWritePolicy,
+    TranslationAggregationPolicy,
+)
 
 
 def _make_profile() -> Profile:
@@ -144,6 +151,41 @@ def test_compute_sync_plan_create_lingq_includes_fragment_when_configured():
     create_ops = [op for op in plan.operations if op.op_type == "create_lingq"]
     assert len(create_ops) == 1
     assert create_ops[0].details.get("fragment") == "Hej, jag heter Mirza."
+
+
+def test_compute_sync_plan_prefer_anki_allows_decreasing_lingq_status():
+    profile = _make_profile()
+    profile.enable_scheduling_writes = True
+
+    opts = RunOptions(
+        ambiguous_match_policy=AmbiguousMatchPolicy.ASK,
+        translation_aggregation_policy=TranslationAggregationPolicy.ASK,
+        scheduling_write_policy=SchedulingWritePolicy.INHERIT_PROFILE,
+        progress_authority_policy=ProgressAuthorityPolicy.PREFER_ANKI,
+    )
+
+    anki_notes = [
+        {
+            "note_id": 1,
+            "fields": {"Front": "hej", "Back": "hi", "LingQ_PK": "10"},
+            "cards": [{"reps": 10, "ivl": 0, "queue": 3, "ord": 0, "id": 1}],
+        }
+    ]
+    lingq_cards = [
+        {
+            "pk": 10,
+            "term": "hej",
+            "status": 4,
+            "hints": [{"locale": "en", "text": "hi"}],
+        }
+    ]
+
+    plan = compute_sync_plan(
+        anki_notes, lingq_cards, profile, profile.meaning_locale, run_options=opts
+    )
+    updates = [op for op in plan.operations if op.op_type == "update_status"]
+    assert len(updates) == 1
+    assert updates[0].details.get("status") == 1
 
 
 def test_compute_sync_plan_duplicate_pk_conflict():
