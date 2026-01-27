@@ -2,11 +2,61 @@
 from __future__ import annotations
 
 import importlib
-from typing import TYPE_CHECKING, Dict, List, Optional
+import threading
+import uuid
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
 if TYPE_CHECKING:
     from config_model import Profile
     from diff_engine import SyncPlan
+
+try:
+    from .config_dialog import ConfigDialog
+except ImportError:
+    from config_dialog import ConfigDialog
+
+try:
+    from .run_options import (
+        AmbiguousMatchPolicy,
+        TranslationAggregationPolicy,
+        SchedulingWritePolicy,
+        RunOptions,
+        validate_run_options,
+        run_options_to_dict,
+        dict_to_run_options,
+    )
+except ImportError:
+    from run_options import (
+        AmbiguousMatchPolicy,
+        TranslationAggregationPolicy,
+        SchedulingWritePolicy,
+        RunOptions,
+        validate_run_options,
+        run_options_to_dict,
+        dict_to_run_options,
+    )
+
+try:
+    from .diff_engine import compute_sync_plan
+    from .lingq_client import LingQApiError, LingQClient
+except ImportError:
+    from diff_engine import compute_sync_plan  # type: ignore[no-redef]
+    from lingq_client import LingQApiError, LingQClient  # type: ignore[no-redef]
+
+try:
+    from .apply_engine import (
+        Checkpoint,
+        apply_sync_plan,
+        clear_checkpoint,
+        load_checkpoint,
+    )
+except ImportError:
+    from apply_engine import (  # type: ignore[no-redef]
+        Checkpoint,
+        apply_sync_plan,
+        clear_checkpoint,
+        load_checkpoint,
+    )
 
 qt = importlib.import_module("aqt.qt")
 QDialog = qt.QDialog
@@ -26,6 +76,9 @@ QSizePolicy = qt.QSizePolicy
 QFont = qt.QFont
 Qt = qt.Qt
 QAbstractItemView = qt.QAbstractItemView
+QScrollArea = qt.QScrollArea
+QWidget = qt.QWidget
+QMessageBox = qt.QMessageBox
 
 # Import table widget separately for clarity
 _QTableWidget = qt.QTableWidget
@@ -42,6 +95,7 @@ class SyncDialog(QDialog):
 
         self._current_plan: Optional["SyncPlan"] = None
         self._profiles: List["Profile"] = []
+        self._run_options: RunOptions = self._get_safe_default_run_options()
 
         self._setup_ui()
         self._load_profiles()
@@ -49,7 +103,41 @@ class SyncDialog(QDialog):
 
     def _setup_ui(self) -> None:
         """Build the complete dialog layout."""
-        main_layout = QVBoxLayout(self)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setSpacing(0)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+
+        # === Scrollable Content Area ===
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_area.setStyleSheet("""
+            QScrollArea {
+                background: transparent;
+                border: none;
+            }
+            QScrollBar:vertical {
+                background: palette(window);
+                width: 8px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical {
+                background: palette(mid);
+                border-radius: 4px;
+                min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: palette(dark);
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+        """)
+
+        scroll_content = QWidget()
+        scroll_content.setStyleSheet("background: transparent;")
+        main_layout = QVBoxLayout(scroll_content)
         main_layout.setSpacing(16)
         main_layout.setContentsMargins(20, 20, 20, 20)
 
@@ -63,6 +151,10 @@ class SyncDialog(QDialog):
         # === Profile Selection ===
         profile_section = self._create_profile_section()
         main_layout.addLayout(profile_section)
+
+        # === Run Options Section ===
+        run_options_section = self._create_run_options_section()
+        main_layout.addLayout(run_options_section)
 
         # === Action Buttons ===
         action_section = self._create_action_section()
@@ -83,9 +175,28 @@ class SyncDialog(QDialog):
         log_section = self._create_log_section()
         main_layout.addLayout(log_section, stretch=1)
 
-        # === Progress Section ===
+        # Add stretch at bottom to push content up when there's extra space
+        main_layout.addStretch()
+
+        scroll_area.setWidget(scroll_content)
+        outer_layout.addWidget(scroll_area, stretch=1)
+
+        # === Progress Section (fixed at bottom) ===
+        progress_container = QWidget()
+        progress_container.setStyleSheet("""
+            QWidget {
+                background: palette(window);
+                border-top: 1px solid palette(mid);
+            }
+        """)
+        progress_layout = QVBoxLayout(progress_container)
+        progress_layout.setContentsMargins(20, 12, 20, 12)
+        progress_layout.setSpacing(8)
+
         progress_section = self._create_progress_section()
-        main_layout.addLayout(progress_section)
+        progress_layout.addLayout(progress_section)
+
+        outer_layout.addWidget(progress_container)
 
     def _create_header_section(self) -> QHBoxLayout:
         """Create the title header."""
@@ -96,10 +207,12 @@ class SyncDialog(QDialog):
         title_font.setPointSize(18)
         title_font.setBold(True)
         title.setFont(title_font)
-        title.setStyleSheet("color: #2563eb;")
+        title.setStyleSheet("color: palette(link);")
 
         subtitle = QLabel("Synchronize your vocabulary between LingQ and Anki")
-        subtitle.setStyleSheet("color: #64748b; font-size: 12px;")
+        subtitle.setStyleSheet(
+            "color: palette(window-text); font-size: 12px; opacity: 0.7;"
+        )
 
         title_layout = QVBoxLayout()
         title_layout.setSpacing(4)
@@ -116,33 +229,326 @@ class SyncDialog(QDialog):
         layout = QHBoxLayout()
 
         profile_label = QLabel("Profile:")
-        profile_label.setStyleSheet("font-weight: 600; color: #374151;")
+        profile_label.setStyleSheet("font-weight: 600; color: palette(window-text);")
 
         self.profile_combo = QComboBox()
         self.profile_combo.setMinimumWidth(250)
         self.profile_combo.setStyleSheet("""
             QComboBox {
                 padding: 8px 12px;
-                border: 1px solid #d1d5db;
+                border: 1px solid palette(mid);
                 border-radius: 6px;
-                background: white;
+                background: palette(base);
+                color: palette(text);
                 font-size: 13px;
             }
             QComboBox:hover {
-                border-color: #2563eb;
+                border-color: palette(highlight);
             }
             QComboBox::drop-down {
                 border: none;
                 padding-right: 8px;
             }
+            QComboBox QAbstractItemView {
+                background: palette(base);
+                color: palette(text);
+                selection-background-color: palette(highlight);
+                selection-color: palette(highlighted-text);
+            }
         """)
         self.profile_combo.currentIndexChanged.connect(self._on_profile_changed)
 
+        self.manage_profiles_btn = QPushButton("Manage...")
+        self.manage_profiles_btn.setStyleSheet("""
+            QPushButton {
+                padding: 8px 14px;
+                background: palette(button);
+                border: 1px solid palette(mid);
+                border-radius: 6px;
+                font-weight: 600;
+                color: palette(button-text);
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background: palette(light);
+                border-color: palette(dark);
+            }
+            QPushButton:pressed {
+                background: palette(midlight);
+            }
+        """)
+        self.manage_profiles_btn.clicked.connect(self._open_config_dialog)
+
         layout.addWidget(profile_label)
         layout.addWidget(self.profile_combo)
+        layout.addWidget(self.manage_profiles_btn)
         layout.addStretch()
 
         return layout
+
+    def _create_run_options_section(self) -> QVBoxLayout:
+        layout = QVBoxLayout()
+        layout.setSpacing(12)
+
+        header = QLabel("Run Options")
+        header.setStyleSheet(
+            "font-weight: 600; font-size: 14px; color: palette(window-text);"
+        )
+        layout.addWidget(header)
+
+        options_frame = QFrame()
+        options_frame.setStyleSheet("""
+            QFrame {
+                background: palette(base);
+                border: 1px solid palette(mid);
+                border-radius: 8px;
+                padding: 12px;
+            }
+        """)
+
+        options_layout = QVBoxLayout(options_frame)
+        options_layout.setSpacing(12)
+        options_layout.setContentsMargins(16, 12, 16, 12)
+
+        dropdown_style = """
+            QComboBox {
+                padding: 6px 10px;
+                border: 1px solid palette(mid);
+                border-radius: 5px;
+                background: palette(window);
+                color: palette(text);
+                font-size: 12px;
+                min-width: 220px;
+            }
+            QComboBox:hover {
+                border-color: palette(highlight);
+            }
+            QComboBox::drop-down {
+                border: none;
+                padding-right: 6px;
+            }
+            QComboBox QAbstractItemView {
+                background: palette(base);
+                color: palette(text);
+                selection-background-color: palette(highlight);
+                selection-color: palette(highlighted-text);
+            }
+        """
+
+        self.ambiguous_combo = QComboBox()
+        self.ambiguous_combo.setStyleSheet(dropdown_style)
+        self.ambiguous_combo.addItem("Choose...", AmbiguousMatchPolicy.UNSET)
+        self.ambiguous_combo.addItem(
+            "Ask me (show conflicts)", AmbiguousMatchPolicy.ASK
+        )
+        self.ambiguous_combo.addItem("Skip", AmbiguousMatchPolicy.SKIP)
+        self.ambiguous_combo.addItem(
+            "Conservative skip", AmbiguousMatchPolicy.CONSERVATIVE_SKIP
+        )
+        self.ambiguous_combo.addItem(
+            "Aggressive: link first (unsafe)",
+            AmbiguousMatchPolicy.AGGRESSIVE_LINK_FIRST,
+        )
+        self.ambiguous_combo.currentIndexChanged.connect(self._on_run_option_changed)
+
+        ambiguous_row = self._create_option_row(
+            "Ambiguous matches:",
+            "How to handle terms that match multiple cards",
+            self.ambiguous_combo,
+        )
+        options_layout.addLayout(ambiguous_row)
+
+        self.aggregation_combo = QComboBox()
+        self.aggregation_combo.setStyleSheet(dropdown_style)
+        self.aggregation_combo.addItem("Choose...", TranslationAggregationPolicy.UNSET)
+        self.aggregation_combo.addItem("Ask me", TranslationAggregationPolicy.ASK)
+        self.aggregation_combo.addItem("Skip", TranslationAggregationPolicy.SKIP)
+        self.aggregation_combo.addItem(
+            "MIN (shortest)", TranslationAggregationPolicy.MIN
+        )
+        self.aggregation_combo.addItem(
+            "MAX (longest)", TranslationAggregationPolicy.MAX
+        )
+        self.aggregation_combo.addItem(
+            "AVG (median length)", TranslationAggregationPolicy.AVG
+        )
+        self.aggregation_combo.currentIndexChanged.connect(self._on_run_option_changed)
+
+        aggregation_row = self._create_option_row(
+            "Multi-translation:",
+            "How to pick a hint when Anki has multiple translations",
+            self.aggregation_combo,
+        )
+        options_layout.addLayout(aggregation_row)
+
+        self.scheduling_combo = QComboBox()
+        self.scheduling_combo.setStyleSheet(dropdown_style)
+        self.scheduling_combo.addItem("Choose...", SchedulingWritePolicy.UNSET)
+        self.scheduling_combo.addItem(
+            "Inherit from profile", SchedulingWritePolicy.INHERIT_PROFILE
+        )
+        self.scheduling_combo.addItem("Force ON", SchedulingWritePolicy.FORCE_ON)
+        self.scheduling_combo.addItem("Force OFF", SchedulingWritePolicy.FORCE_OFF)
+        self.scheduling_combo.currentIndexChanged.connect(self._on_run_option_changed)
+
+        scheduling_row = self._create_option_row(
+            "Scheduling writes:",
+            "Override profile setting for Anki rescheduling",
+            self.scheduling_combo,
+        )
+        options_layout.addLayout(scheduling_row)
+
+        self.run_options_warning = QLabel("")
+        self.run_options_warning.setStyleSheet(
+            "color: #ef4444; font-size: 11px; font-weight: 500; background: transparent; border: none;"
+        )
+        self.run_options_warning.setWordWrap(True)
+        self.run_options_warning.hide()
+        options_layout.addWidget(self.run_options_warning)
+
+        layout.addWidget(options_frame)
+
+        return layout
+
+    def _create_option_row(
+        self, label_text: str, help_text: str, combo: QComboBox
+    ) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(12)
+
+        # Wrap labels in a QWidget for explicit width control
+        try:
+            QWidget = qt.QWidget
+        except AttributeError:
+            QWidget = importlib.import_module("aqt.qt").QWidget
+
+        label_widget = QWidget()
+        label_widget.setMinimumWidth(280)
+        label_container = QVBoxLayout(label_widget)
+        label_container.setSpacing(2)
+        label_container.setContentsMargins(0, 0, 0, 0)
+
+        label = QLabel(label_text)
+        label.setStyleSheet(
+            "font-weight: 600; font-size: 12px; color: palette(window-text); background: transparent; border: none;"
+        )
+        label_container.addWidget(label)
+
+        help_label = QLabel(help_text)
+        help_label.setWordWrap(True)
+        help_label.setStyleSheet(
+            "font-size: 10px; color: palette(window-text); opacity: 0.65; background: transparent; border: none;"
+        )
+        label_container.addWidget(help_label)
+
+        row.addWidget(label_widget, stretch=1)
+        row.addWidget(combo, stretch=0)
+
+        return row
+
+    def _get_safe_default_run_options(self) -> RunOptions:
+        return RunOptions(
+            ambiguous_match_policy=AmbiguousMatchPolicy.ASK,
+            translation_aggregation_policy=TranslationAggregationPolicy.ASK,
+            scheduling_write_policy=SchedulingWritePolicy.INHERIT_PROFILE,
+        )
+
+    def _on_run_option_changed(self) -> None:
+        self._run_options = RunOptions(
+            ambiguous_match_policy=self.ambiguous_combo.currentData(),
+            translation_aggregation_policy=self.aggregation_combo.currentData(),
+            scheduling_write_policy=self.scheduling_combo.currentData(),
+        )
+        self._update_button_states()
+        self._save_run_options_for_profile()
+
+    def _get_run_options_meta_key(self, profile_name: str) -> str:
+        return f"lingq_sync:last_run_options:{profile_name}"
+
+    def _pm_meta_get(self, key: str, default=None):
+        try:
+            from aqt import mw
+
+            if not mw or not getattr(mw, "pm", None):
+                return default
+            pm = mw.pm
+            meta = getattr(pm, "meta", None)
+            if isinstance(meta, dict):
+                return meta.get(key, default)
+            profile = getattr(pm, "profile", None)
+            if isinstance(profile, dict):
+                return profile.get("meta", {}).get(key, default)
+        except Exception:
+            return default
+        return default
+
+    def _pm_meta_set(self, key: str, value) -> None:
+        try:
+            from aqt import mw
+
+            if not mw or not getattr(mw, "pm", None):
+                return
+            pm = mw.pm
+            meta = getattr(pm, "meta", None)
+            if isinstance(meta, dict):
+                meta[key] = value
+                return
+            profile = getattr(pm, "profile", None)
+            if isinstance(profile, dict):
+                profile_meta = profile.get("meta")
+                if isinstance(profile_meta, dict):
+                    profile_meta[key] = value
+                else:
+                    profile["meta"] = {key: value}
+        except Exception:
+            return
+
+    def _save_run_options_for_profile(self) -> None:
+        profile = self._get_selected_profile()
+        if not profile:
+            return
+        key = self._get_run_options_meta_key(profile.name)
+        self._pm_meta_set(key, run_options_to_dict(self._run_options))
+
+    def _load_run_options_for_profile(self) -> None:
+        profile = self._get_selected_profile()
+        if not profile:
+            self._run_options = self._get_safe_default_run_options()
+            self._sync_combos_from_run_options()
+            return
+
+        loaded_opts: Optional[RunOptions] = None
+        key = self._get_run_options_meta_key(profile.name)
+        saved = self._pm_meta_get(key, None)
+        if saved:
+            try:
+                loaded_opts = dict_to_run_options(saved)
+            except Exception:
+                loaded_opts = None
+
+        if loaded_opts is None:
+            loaded_opts = self._get_safe_default_run_options()
+
+        self._run_options = loaded_opts
+        self._sync_combos_from_run_options()
+
+    def _sync_combos_from_run_options(self) -> None:
+        self._set_combo_by_data(
+            self.ambiguous_combo, self._run_options.ambiguous_match_policy
+        )
+        self._set_combo_by_data(
+            self.aggregation_combo, self._run_options.translation_aggregation_policy
+        )
+        self._set_combo_by_data(
+            self.scheduling_combo, self._run_options.scheduling_write_policy
+        )
+
+    def _set_combo_by_data(self, combo: QComboBox, value) -> None:
+        for i in range(combo.count()):
+            if combo.itemData(i) == value:
+                combo.setCurrentIndex(i)
+                return
+        combo.setCurrentIndex(0)
 
     def _create_action_section(self) -> QHBoxLayout:
         """Create action buttons: Dry Run, Apply, Close."""
@@ -151,53 +557,94 @@ class SyncDialog(QDialog):
 
         # Dry Run button
         self.dry_run_btn = QPushButton("Dry Run")
+        try:
+            self.dry_run_btn.setToolTip(
+                "Compute a sync plan without making any changes."
+            )
+        except Exception:
+            pass
         self.dry_run_btn.setStyleSheet("""
             QPushButton {
                 padding: 10px 24px;
-                background: #f1f5f9;
-                border: 1px solid #cbd5e1;
+                background: palette(button);
+                border: 1px solid palette(mid);
                 border-radius: 6px;
                 font-weight: 600;
-                color: #475569;
+                color: palette(button-text);
                 font-size: 13px;
             }
             QPushButton:hover {
-                background: #e2e8f0;
-                border-color: #94a3b8;
+                background: palette(light);
+                border-color: palette(dark);
             }
             QPushButton:pressed {
-                background: #cbd5e1;
+                background: palette(midlight);
             }
             QPushButton:disabled {
-                background: #f8fafc;
-                color: #94a3b8;
+                background: palette(window);
+                color: palette(mid);
             }
         """)
         self.dry_run_btn.clicked.connect(self._on_dry_run)
 
         # Apply button
         self.apply_btn = QPushButton("Apply")
+        try:
+            self.apply_btn.setToolTip(
+                "Execute the sync plan (writes to Anki and LingQ). Requires a Dry Run first."
+            )
+        except Exception:
+            pass
         self.apply_btn.setStyleSheet("""
             QPushButton {
                 padding: 10px 24px;
-                background: #2563eb;
+                background: palette(highlight);
                 border: none;
                 border-radius: 6px;
                 font-weight: 600;
-                color: white;
+                color: palette(highlighted-text);
                 font-size: 13px;
             }
             QPushButton:hover {
-                background: #1d4ed8;
+                background: palette(highlight);
             }
             QPushButton:pressed {
-                background: #1e40af;
+                background: palette(highlight);
             }
             QPushButton:disabled {
-                background: #93c5fd;
+                background: palette(mid);
+                color: palette(midlight);
             }
         """)
         self.apply_btn.clicked.connect(self._on_apply)
+
+        # Self-check button
+        self.self_check_btn = QPushButton("Self-check")
+        try:
+            self.self_check_btn.setToolTip(
+                "Run quick diagnostics: profile loading, run options validation, and persistence."
+            )
+        except Exception:
+            pass
+        self.self_check_btn.setStyleSheet("""
+            QPushButton {
+                padding: 10px 24px;
+                background: palette(button);
+                border: 1px solid palette(mid);
+                border-radius: 6px;
+                font-weight: 600;
+                color: palette(button-text);
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background: palette(light);
+                border-color: palette(dark);
+            }
+            QPushButton:pressed {
+                background: palette(midlight);
+            }
+        """)
+        self.self_check_btn.clicked.connect(self._on_self_check)
 
         # Close button
         close_btn = QPushButton("Close")
@@ -205,38 +652,41 @@ class SyncDialog(QDialog):
             QPushButton {
                 padding: 10px 24px;
                 background: transparent;
-                border: 1px solid #e5e7eb;
+                border: 1px solid palette(mid);
                 border-radius: 6px;
                 font-weight: 500;
-                color: #6b7280;
+                color: palette(window-text);
                 font-size: 13px;
             }
             QPushButton:hover {
-                background: #f9fafb;
-                border-color: #d1d5db;
+                background: palette(button);
+                border-color: palette(dark);
             }
         """)
         close_btn.clicked.connect(self.close)
 
         layout.addWidget(self.dry_run_btn)
         layout.addWidget(self.apply_btn)
+        layout.addWidget(self.self_check_btn)
         layout.addStretch()
         layout.addWidget(close_btn)
 
         return layout
 
     def _create_summary_section(self) -> QVBoxLayout:
-        """Create summary stats display."""
         layout = QVBoxLayout()
         layout.setSpacing(8)
 
         header = QLabel("Summary")
-        header.setStyleSheet("font-weight: 600; font-size: 14px; color: #1f2937;")
+        header.setStyleSheet(
+            "font-weight: 600; font-size: 14px; color: palette(window-text);"
+        )
         layout.addWidget(header)
 
-        # Stats grid
         stats_layout = QGridLayout()
-        stats_layout.setSpacing(16)
+        stats_layout.setSpacing(12)
+        stats_layout.setColumnStretch(0, 1)
+        stats_layout.setColumnStretch(1, 1)
 
         self._stat_labels: Dict[str, QLabel] = {}
         stats = [
@@ -250,24 +700,28 @@ class SyncDialog(QDialog):
         ]
 
         for idx, (key, label, color) in enumerate(stats):
-            row = idx // 4
-            col = idx % 4
+            row = idx // 2
+            col = idx % 2
 
-            stat_widget = self._create_stat_widget(label, "0", color)
-            self._stat_labels[key] = stat_widget.findChild(QLabel, f"stat_value_{key}")
+            stat_widget, value_label = self._create_stat_widget(key, label, "0", color)
+            self._stat_labels[key] = value_label
             stats_layout.addWidget(stat_widget, row, col)
 
         layout.addLayout(stats_layout)
 
         return layout
 
-    def _create_stat_widget(self, label: str, value: str, color: str) -> QFrame:
-        """Create a single stat display widget."""
+    def _create_stat_widget(
+        self, key: str, label: str, value: str, color: str
+    ) -> tuple[QFrame, QLabel]:
         frame = QFrame()
+        frame.setMinimumHeight(70)
+        frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         frame.setStyleSheet(f"""
             QFrame {{
-                background: {color}10;
-                border: 1px solid {color}30;
+                background: palette(base);
+                border: 1px solid palette(mid);
+                border-left: 3px solid {color};
                 border-radius: 8px;
                 padding: 8px;
             }}
@@ -278,20 +732,22 @@ class SyncDialog(QDialog):
         layout.setSpacing(2)
 
         value_label = QLabel(value)
-        value_label.setObjectName(
-            f"stat_value_{label.lower().replace(' ', '_').replace('(', '').replace(')', '')}"
+        value_label.setObjectName(f"stat_value_{key}")
+        value_label.setStyleSheet(
+            f"font-size: 20px; font-weight: 700; color: {color}; background: transparent; border: none;"
         )
-        value_label.setStyleSheet(f"font-size: 20px; font-weight: 700; color: {color};")
         value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         name_label = QLabel(label)
-        name_label.setStyleSheet("font-size: 11px; color: #64748b;")
+        name_label.setStyleSheet(
+            "font-size: 11px; color: palette(window-text); background: transparent; border: none;"
+        )
         name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         layout.addWidget(value_label)
         layout.addWidget(name_label)
 
-        return frame
+        return frame, value_label
 
     def _create_conflicts_section(self) -> QVBoxLayout:
         """Create conflicts list display."""
@@ -301,7 +757,7 @@ class SyncDialog(QDialog):
         header_layout = QHBoxLayout()
         self.conflicts_header = QLabel("Conflicts (0)")
         self.conflicts_header.setStyleSheet(
-            "font-weight: 600; font-size: 14px; color: #1f2937;"
+            "font-weight: 600; font-size: 14px; color: palette(window-text);"
         )
         header_layout.addWidget(self.conflicts_header)
         header_layout.addStretch()
@@ -335,21 +791,23 @@ class SyncDialog(QDialog):
         self.conflicts_table.setMaximumHeight(120)
         self.conflicts_table.setStyleSheet("""
             QTableWidget {
-                border: 1px solid #e5e7eb;
+                border: 1px solid palette(mid);
                 border-radius: 6px;
-                background: white;
-                gridline-color: #f3f4f6;
+                background: palette(base);
+                color: palette(text);
+                gridline-color: palette(midlight);
             }
             QTableWidget::item {
                 padding: 6px 8px;
+                color: palette(text);
             }
             QHeaderView::section {
-                background: #f9fafb;
+                background: palette(button);
                 border: none;
-                border-bottom: 1px solid #e5e7eb;
+                border-bottom: 1px solid palette(mid);
                 padding: 8px;
                 font-weight: 600;
-                color: #374151;
+                color: palette(button-text);
             }
         """)
 
@@ -364,7 +822,9 @@ class SyncDialog(QDialog):
 
         header_layout = QHBoxLayout()
         log_header = QLabel("Log")
-        log_header.setStyleSheet("font-weight: 600; font-size: 14px; color: #1f2937;")
+        log_header.setStyleSheet(
+            "font-weight: 600; font-size: 14px; color: palette(window-text);"
+        )
         header_layout.addWidget(log_header)
         header_layout.addStretch()
 
@@ -373,13 +833,13 @@ class SyncDialog(QDialog):
             QPushButton {
                 padding: 4px 12px;
                 background: transparent;
-                border: 1px solid #e5e7eb;
+                border: 1px solid palette(mid);
                 border-radius: 4px;
                 font-size: 12px;
-                color: #6b7280;
+                color: palette(window-text);
             }
             QPushButton:hover {
-                background: #f9fafb;
+                background: palette(button);
             }
         """)
         clear_btn.clicked.connect(self._clear_log)
@@ -391,10 +851,10 @@ class SyncDialog(QDialog):
         self.log_output.setReadOnly(True)
         self.log_output.setStyleSheet("""
             QTextEdit {
-                border: 1px solid #e5e7eb;
+                border: 1px solid palette(mid);
                 border-radius: 6px;
-                background: #1e293b;
-                color: #e2e8f0;
+                background: palette(base);
+                color: palette(text);
                 font-family: 'SF Mono', 'Menlo', 'Monaco', 'Consolas', monospace;
                 font-size: 12px;
                 padding: 12px;
@@ -420,17 +880,16 @@ class SyncDialog(QDialog):
             QProgressBar {
                 border: none;
                 border-radius: 3px;
-                background: #e5e7eb;
+                background: palette(mid);
             }
             QProgressBar::chunk {
                 border-radius: 3px;
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #2563eb, stop:1 #7c3aed);
+                background: palette(highlight);
             }
         """)
 
         self.status_label = QLabel("Ready")
-        self.status_label.setStyleSheet("font-size: 12px; color: #64748b;")
+        self.status_label.setStyleSheet("font-size: 12px; color: palette(window-text);")
 
         layout.addWidget(self.progress_bar)
         layout.addWidget(self.status_label)
@@ -441,7 +900,7 @@ class SyncDialog(QDialog):
         """Create a horizontal separator line."""
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
-        line.setStyleSheet("background: #e5e7eb;")
+        line.setStyleSheet("background: palette(mid);")
         line.setMaximumHeight(1)
         return line
 
@@ -450,23 +909,36 @@ class SyncDialog(QDialog):
     def _load_profiles(self) -> None:
         """Load profiles from config and populate dropdown."""
         try:
-            from config_manager import load_config
+            try:
+                from .config_manager import load_config
+            except ImportError:
+                from config_manager import load_config
 
             config = load_config()
             self._profiles = config.profiles
+
+            previous_selection = self.profile_combo.currentText()
 
             self.profile_combo.clear()
             if not self._profiles:
                 self.profile_combo.addItem("(No profiles configured)")
                 self._log("No profiles found. Please configure a sync profile first.")
+                self.manage_profiles_btn.setFocus()
             else:
                 for profile in self._profiles:
                     self.profile_combo.addItem(profile.name)
                 self._log(f"Loaded {len(self._profiles)} profile(s)")
+                if previous_selection:
+                    idx = self.profile_combo.findText(previous_selection)
+                    if idx != -1:
+                        self.profile_combo.setCurrentIndex(idx)
+                    else:
+                        self.profile_combo.setCurrentIndex(0)
 
         except Exception as e:
             self._log(f"Error loading profiles: {e}")
             self.profile_combo.addItem("(Error loading profiles)")
+            self.manage_profiles_btn.setFocus()
 
     def _get_selected_profile(self) -> Optional["Profile"]:
         """Get the currently selected profile."""
@@ -478,43 +950,375 @@ class SyncDialog(QDialog):
     # === Button State Management ===
 
     def _update_button_states(self) -> None:
-        """Update button enabled states based on current state."""
         has_profile = self._get_selected_profile() is not None
         has_plan = self._current_plan is not None
+        has_conflicts = bool(self._current_plan and self._current_plan.get_conflicts())
 
-        self.dry_run_btn.setEnabled(has_profile)
-        self.apply_btn.setEnabled(has_profile and has_plan)
+        validation_errors = validate_run_options(self._run_options)
+        run_options_valid = len(validation_errors) == 0
+
+        if validation_errors:
+            missing = []
+            for err in validation_errors:
+                if "Ambiguous" in err:
+                    missing.append("Ambiguous matches")
+                elif "aggregation" in err:
+                    missing.append("Multi-translation")
+                elif "Scheduling" in err:
+                    missing.append("Scheduling writes")
+            self.run_options_warning.setText(f"Please select: {', '.join(missing)}")
+            self.run_options_warning.show()
+        else:
+            self.run_options_warning.hide()
+
+        self.dry_run_btn.setEnabled(has_profile and run_options_valid)
+        self.apply_btn.setEnabled(
+            has_profile and has_plan and (not has_conflicts) and run_options_valid
+        )
 
     # === Event Handlers ===
 
     def _on_profile_changed(self, index: int) -> None:
-        """Handle profile selection change."""
         self._current_plan = None
         self._clear_results()
+        self._load_run_options_for_profile()
         self._update_button_states()
 
         profile = self._get_selected_profile()
         if profile:
             self._log(f"Selected profile: {profile.name}")
 
+    def _open_config_dialog(self) -> None:
+        """Open the configuration dialog and reload profiles on close."""
+        previous_selection = self.profile_combo.currentText()
+        dialog = ConfigDialog(self)
+        dialog.exec()
+
+        self._load_profiles()
+        if self._profiles:
+            idx = self.profile_combo.findText(previous_selection)
+            if idx != -1:
+                self.profile_combo.setCurrentIndex(idx)
+            else:
+                self.profile_combo.setCurrentIndex(0)
+        else:
+            self._log("No profiles available after closing configuration dialog.")
+            self.manage_profiles_btn.setFocus()
+
+    def _ensure_identity_fields_exist(self, profile: "Profile") -> bool:
+        """Ensure LingQ identity fields exist on the configured note type.
+
+        Returns True if ready to proceed, False if user cancelled or operation failed.
+        """
+        try:
+            from aqt import mw
+
+            if not mw or not getattr(mw, "col", None):
+                self._log("Apply blocked: Anki collection not available")
+                return False
+            models = mw.col.models
+        except Exception as e:
+            self._log(f"Apply blocked: cannot access Anki models: {e}")
+            return False
+
+        note_type = str(getattr(profile.lingq_to_anki, "note_type", "") or "").strip()
+        if not note_type:
+            self._log("Apply blocked: profile missing note type")
+            return False
+
+        model = models.by_name(note_type)
+        if not model:
+            self._log(f"Apply blocked: note type not found: {note_type}")
+            return False
+
+        try:
+            existing_fields = set(models.field_names(model))
+        except Exception:
+            existing_fields = set()
+
+        pk_field = str(profile.lingq_to_anki.identity_fields.pk_field or "").strip()
+        canon_field = str(
+            profile.lingq_to_anki.identity_fields.canonical_term_field or ""
+        ).strip()
+        required = [f for f in [pk_field, canon_field] if f]
+        missing = [f for f in required if f not in existing_fields]
+
+        if not missing:
+            return True
+
+        msg = (
+            f"Your note type '{note_type}' is missing required LingQ fields:\n\n"
+            + "\n".join(f"- {f}" for f in missing)
+            + "\n\nCreate them automatically now?\n\n"
+            + "This will add empty fields to all notes of that note type (safe, reversible)."
+        )
+
+        confirm = QMessageBox.question(
+            self,
+            "Create Missing Fields?",
+            msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            self._log("Apply cancelled: required identity fields missing")
+            return False
+
+        try:
+            for field_name in missing:
+                # new_field/add_field exist in newer Anki; fall back to camelCase.
+                if hasattr(models, "new_field"):
+                    fld = models.new_field(field_name)
+                else:
+                    fld = models.newField(field_name)  # type: ignore[attr-defined]
+
+                if hasattr(models, "add_field"):
+                    models.add_field(model, fld)
+                else:
+                    models.addField(model, fld)  # type: ignore[attr-defined]
+
+            if hasattr(models, "save"):
+                models.save(model)
+            elif hasattr(models, "update"):
+                models.update(model)  # type: ignore[attr-defined]
+
+            # Best-effort UI refresh.
+            try:
+                mw.reset()
+            except Exception:
+                pass
+
+            self._log(
+                f"Created missing identity fields on note type '{note_type}': {', '.join(missing)}"
+            )
+            return True
+        except Exception as e:
+            self._log(f"Failed to create fields on note type '{note_type}': {e}")
+            return False
+
     def _on_dry_run(self) -> None:
-        """Execute dry run to compute sync plan."""
         profile = self._get_selected_profile()
         if not profile:
             self._log("No profile selected")
             return
 
+        validation_errors = validate_run_options(self._run_options)
+        if validation_errors:
+            self._log("Dry run blocked: run options incomplete")
+            for err in validation_errors:
+                self._log(f"  - {err}")
+            return
+
+        # Reset previous plan/results.
+        self._current_plan = None
+        self._clear_results()
+        self._update_button_states()
+
+        self._set_progress(0)
         self._set_status("Computing sync plan...")
         self._log(f"Starting dry run for profile: {profile.name}")
+        self._log(
+            f"Run options: ambiguous={self._run_options.ambiguous_match_policy.value}, "
+            f"aggregation={self._run_options.translation_aggregation_policy.value}, "
+            f"scheduling={self._run_options.scheduling_write_policy.value}"
+        )
 
-        # TODO: Wire up actual sync plan computation using QueryOp
-        # For now, just show the UI is ready
-        self._log("Dry run not yet implemented - UI structure complete")
-        self._set_status("Ready")
+        def call_on_main(fn: Callable[[], None]) -> None:
+            try:
+                from aqt import mw
+
+                tm = getattr(mw, "taskman", None)
+                if tm and hasattr(tm, "run_on_main"):
+                    tm.run_on_main(fn)
+                    return
+            except Exception:
+                pass
+            try:
+                qt.QTimer.singleShot(0, fn)
+            except Exception:
+                fn()
+
+        def set_stage(message: str, progress: int) -> None:
+            def _apply() -> None:
+                self._set_status(message)
+                self._set_progress(progress)
+
+            call_on_main(_apply)
+
+        def snapshot_anki_notes() -> List[Dict[str, Any]]:
+            from aqt import mw
+
+            col = mw.col
+            note_type = str(
+                getattr(profile.lingq_to_anki, "note_type", "") or ""
+            ).strip()
+
+            def esc(s: str) -> str:
+                return s.replace('"', r'\\"')
+
+            note_query = f'note:"{esc(note_type)}"' if note_type else ""
+
+            pk_field = profile.lingq_to_anki.identity_fields.pk_field
+            pk_query = (
+                f'{note_query} "{esc(pk_field)}:*"'
+                if note_type
+                else f'"{esc(pk_field)}:*"'
+            )
+
+            ids: Set[int] = set()
+            for q in (note_query, pk_query):
+                if not q:
+                    continue
+                try:
+                    ids.update([int(x) for x in col.find_notes(q)])
+                except Exception:
+                    continue
+
+            term_field = profile.anki_to_lingq.term_field
+            translation_fields = list(
+                getattr(profile.anki_to_lingq, "translation_fields", []) or []
+            )
+            frag_field = getattr(profile.anki_to_lingq, "fragment_field", None)
+            canonical_field = profile.lingq_to_anki.identity_fields.canonical_term_field
+
+            field_names: List[str] = []
+            names: List[Any] = [
+                term_field,
+                *translation_fields,
+                pk_field,
+                canonical_field,
+            ]
+            if isinstance(frag_field, str) and frag_field.strip():
+                names.append(frag_field.strip())
+
+            for name in names:
+                n = str(name or "").strip()
+                if n and n not in field_names:
+                    field_names.append(n)
+
+            out: List[Dict[str, Any]] = []
+            for nid in sorted(ids):
+                note = col.get_note(nid)
+                fields: Dict[str, str] = {}
+                for fname in field_names:
+                    try:
+                        fields[fname] = str(note[fname] or "")
+                    except Exception:
+                        fields[fname] = ""
+
+                cards_payload: List[Dict[str, Any]] = []
+                try:
+                    cards = note.cards()
+                except Exception:
+                    cards = []
+                for c in cards or []:
+                    try:
+                        cards_payload.append(
+                            {
+                                "reps": int(getattr(c, "reps", 0) or 0),
+                                "ivl": int(getattr(c, "ivl", 0) or 0),
+                                "queue": int(getattr(c, "queue", 0) or 0),
+                                "ord": int(getattr(c, "ord", 0) or 0),
+                                "id": int(getattr(c, "id", 0) or 0),
+                            }
+                        )
+                    except Exception:
+                        continue
+
+                # Optimization + safety: do not include unlinked notes with zero reviews.
+                # They would otherwise generate massive create_lingq operations.
+                existing_pk_val = str(fields.get(pk_field, "") or "").strip()
+                if not existing_pk_val and cards_payload:
+                    if all(int(x.get("reps", 0) or 0) <= 0 for x in cards_payload):
+                        continue
+
+                out.append(
+                    {"note_id": int(nid), "fields": fields, "cards": cards_payload}
+                )
+            return out
+
+        def fetch_lingq_cards() -> List[Dict[str, Any]]:
+            token = str(getattr(profile, "api_token", "") or "")
+            if not token:
+                raise LingQApiError("Missing LingQ API token for this profile")
+            language = str(getattr(profile, "lingq_language", "") or "").strip()
+            if not language:
+                raise LingQApiError("Missing LingQ language for this profile")
+            client = LingQClient(token)
+            return [dict(c) for c in client.list_cards(language)]
+
+        def task() -> Tuple["SyncPlan", int, int]:
+            set_stage("Fetching Anki notes...", 10)
+            anki_notes = snapshot_anki_notes()
+            set_stage(
+                f"Fetched {len(anki_notes)} Anki notes. Fetching LingQ cards...", 35
+            )
+            lingq_cards = fetch_lingq_cards()
+            set_stage(f"Fetched {len(lingq_cards)} LingQ cards. Computing plan...", 70)
+            plan = compute_sync_plan(
+                anki_notes=anki_notes,
+                lingq_cards=lingq_cards,
+                profile=profile,
+                meaning_locale=profile.meaning_locale,
+                run_options=self._run_options,
+            )
+            return plan, len(anki_notes), len(lingq_cards)
+
+        def on_done(
+            result: Optional[Tuple["SyncPlan", int, int]], err: Optional[BaseException]
+        ) -> None:
+            if err is not None:
+                self._set_progress(0)
+                self._set_status("Ready")
+                self._log(f"Dry run failed: {err}")
+                return
+            if not result:
+                self._set_progress(0)
+                self._set_status("Ready")
+                self._log("Dry run failed: no result")
+                return
+
+            plan, anki_count, lingq_count = result
+            self._log(f"Fetched Anki notes: {anki_count}")
+            self._log(f"Fetched LingQ cards: {lingq_count}")
+            self._display_plan(plan)
+            self._set_progress(100)
+            self._set_status("Ready")
+
+        def run_in_background(task_fn: Callable[[], Any]) -> None:
+            try:
+                from aqt import mw
+
+                tm = getattr(mw, "taskman", None)
+                if tm and hasattr(tm, "run_in_background"):
+
+                    def _done(fut) -> None:  # type: ignore[no-untyped-def]
+                        try:
+                            res = fut.result()
+                            call_on_main(lambda: on_done(res, None))
+                        except BaseException as e:
+                            call_on_main(lambda: on_done(None, e))
+
+                    tm.run_in_background(task_fn, _done)
+                    return
+            except Exception:
+                pass
+
+            # Fallback: thread + best-effort main-thread callback.
+            def _worker() -> None:
+                try:
+                    res = task_fn()
+                    call_on_main(lambda: on_done(res, None))
+                except BaseException as e:
+                    call_on_main(lambda: on_done(None, e))
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        run_in_background(task)
 
     def _on_apply(self) -> None:
-        """Apply the computed sync plan."""
-        if not self._current_plan:
+        plan = self._current_plan
+        if not plan:
             self._log("No sync plan to apply. Run Dry Run first.")
             return
 
@@ -523,12 +1327,263 @@ class SyncDialog(QDialog):
             self._log("No profile selected")
             return
 
+        validation_errors = validate_run_options(self._run_options)
+        if validation_errors:
+            self._log("Apply blocked: run options incomplete")
+            for err in validation_errors:
+                self._log(f"  - {err}")
+            return
+
+        conflicts = list(plan.get_conflicts() or [])
+        if conflicts:
+            self._log(
+                f"Apply blocked: {len(conflicts)} conflict(s) present. "
+                "Resolve conflicts via Dry Run (conflict UI coming soon)."
+            )
+            self._update_button_states()
+            return
+
+        # Preflight: ensure PK/canonical fields exist so OP_LINK/OP_CREATE_ANKI can succeed.
+        if not self._ensure_identity_fields_exist(profile):
+            self._set_status("Ready")
+            self._update_button_states()
+            return
+
+        counts = plan.count_by_type()
+        total_ops = len(getattr(plan, "operations", []) or [])
+
+        lines: List[str] = []
+        lines.append(f"Profile: {profile.name}")
+        lines.append(f"Operations: {total_ops}")
+        for op_type, count in sorted(counts.items()):
+            lines.append(f"  - {op_type}: {count}")
+        lines.append("")
+        lines.append(
+            "This will modify your Anki collection and/or LingQ data. "
+            "The apply run is resumable via checkpointing."
+        )
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Apply",
+            "Apply the current sync plan?\n\n" + "\n".join(lines),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            self._log("Apply cancelled")
+            self._set_status("Ready")
+            return
+
+        # Ensure apply_engine persists checkpoints per-profile.
+        try:
+            setattr(plan, "profile_name", str(profile.name))
+        except Exception:
+            pass
+
         self._set_status("Applying sync plan...")
         self._log(f"Applying sync plan for profile: {profile.name}")
+        self._log(
+            f"Run options: ambiguous={self._run_options.ambiguous_match_policy.value}, "
+            f"aggregation={self._run_options.translation_aggregation_policy.value}, "
+            f"scheduling={self._run_options.scheduling_write_policy.value}"
+        )
 
-        # TODO: Wire up actual sync plan application using QueryOp
-        self._log("Apply not yet implemented - UI structure complete")
-        self._set_status("Ready")
+        self._set_ui_running(True)
+        self._set_busy_progress(True)
+
+        def call_on_main(fn: Callable[[], None]) -> None:
+            try:
+                from aqt import mw
+
+                tm = getattr(mw, "taskman", None)
+                if tm and hasattr(tm, "run_on_main"):
+                    tm.run_on_main(fn)
+                    return
+            except Exception:
+                pass
+            try:
+                qt.QTimer.singleShot(0, fn)
+            except Exception:
+                fn()
+
+        def task() -> Tuple[Any, Optional[Dict[str, Any]]]:
+            token = str(getattr(profile, "api_token", "") or "")
+            if not token:
+                raise LingQApiError("Missing LingQ API token for this profile")
+
+            client = LingQClient(token)
+            checkpoint = load_checkpoint(profile.name) or Checkpoint(run_id="")
+            resume_info: Optional[Dict[str, Any]] = None
+            if checkpoint.run_id:
+                resume_info = {
+                    "run_id": checkpoint.run_id,
+                    "last_processed_index": int(checkpoint.last_processed_index),
+                }
+
+            result = apply_sync_plan(plan, client, checkpoint)
+            finished = int(getattr(checkpoint, "last_processed_index", 0) or 0) >= int(
+                total_ops
+            )
+            if finished:
+                clear_checkpoint(profile.name)
+
+            return result, resume_info
+
+        def on_done(
+            result: Optional[Tuple[Any, Optional[Dict[str, Any]]]],
+            err: Optional[BaseException],
+        ) -> None:
+            self._set_busy_progress(False)
+            self._set_progress(100)
+            self._set_ui_running(False)
+
+            if err is not None:
+                self._set_status("Ready")
+                self._log(f"Apply failed: {err}")
+                self._log(
+                    "Checkpoint (if any) was preserved. Re-run Apply to resume safely."
+                )
+                return
+
+            if not result:
+                self._set_status("Ready")
+                self._log("Apply failed: no result")
+                return
+
+            apply_result, resume_info = result
+            if resume_info:
+                self._log(
+                    "Resumed from checkpoint: "
+                    f"run_id={resume_info.get('run_id')} "
+                    f"index={resume_info.get('last_processed_index')}"
+                )
+
+            success_count = int(getattr(apply_result, "success_count", 0) or 0)
+            skipped_count = int(getattr(apply_result, "skipped_count", 0) or 0)
+            error_count = int(getattr(apply_result, "error_count", 0) or 0)
+            errors = list(getattr(apply_result, "errors", []) or [])
+
+            self._log(
+                f"Apply results: success={success_count}, skipped={skipped_count}, errors={error_count}"
+            )
+            if errors:
+                self._log("First errors:")
+                for msg in errors[:5]:
+                    self._log(f"  - {msg}")
+                if len(errors) > 5:
+                    self._log(f"  ... and {len(errors) - 5} more")
+
+            if error_count:
+                self._set_status("Apply completed with errors")
+            else:
+                self._set_status("Apply completed")
+
+            # Nice-to-have: refresh dry run after a clean apply.
+            if error_count == 0 and success_count > 0:
+                self._log("Refreshing plan (dry run) to confirm 0 changes...")
+                call_on_main(self._on_dry_run)
+
+        def run_in_background(task_fn: Callable[[], Any]) -> None:
+            try:
+                from aqt import mw
+
+                tm = getattr(mw, "taskman", None)
+                if tm and hasattr(tm, "run_in_background"):
+
+                    def _done(fut) -> None:  # type: ignore[no-untyped-def]
+                        try:
+                            res = fut.result()
+                            call_on_main(lambda: on_done(res, None))
+                        except BaseException as e:
+                            call_on_main(lambda: on_done(None, e))
+
+                    tm.run_in_background(task_fn, _done)
+                    return
+
+            except Exception:
+                pass
+
+            # Fallback: thread + best-effort main-thread callback.
+            def _worker() -> None:
+                try:
+                    res = task_fn()
+                    call_on_main(lambda: on_done(res, None))
+                except BaseException as e:
+                    call_on_main(lambda: on_done(None, e))
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        run_in_background(task)
+
+    def _on_self_check(self) -> None:
+        self._set_status("Running self-check...")
+        self._log("Self-check: starting")
+
+        checks_ok = True
+
+        try:
+            try:
+                from .config_manager import load_config
+            except ImportError:
+                from config_manager import load_config
+
+            config = load_config()
+            profiles = getattr(config, "profiles", [])
+            self._log(f"Self-check: profiles loaded ({len(profiles)})")
+        except Exception as e:
+            checks_ok = False
+            self._log(f"Self-check: profile load failed: {e}")
+
+        validation_errors = validate_run_options(self._run_options)
+        if validation_errors:
+            checks_ok = False
+            missing = []
+            for err in validation_errors:
+                if "Ambiguous" in err:
+                    missing.append("Ambiguous matches")
+                elif "aggregation" in err:
+                    missing.append("Multi-translation")
+                elif "Scheduling" in err:
+                    missing.append("Scheduling writes")
+                else:
+                    missing.append(err)
+            if missing:
+                self._log("Self-check: run options missing selections:")
+                for item in missing:
+                    self._log(f"  - {item}")
+        else:
+            self._log("Self-check: run options valid")
+
+        profile = self._get_selected_profile()
+        if not profile:
+            checks_ok = False
+            self._log("Self-check: no profile selected for meta persistence test")
+        else:
+            try:
+                key = f"lingq_sync:self_check:{profile.name}"
+                sentinel_value = f"self_check:{uuid.uuid4().hex}"
+                previous_value = self._pm_meta_get(key, None)
+                self._pm_meta_set(key, sentinel_value)
+                read_back = self._pm_meta_get(key, None)
+                if read_back == sentinel_value:
+                    self._log("Self-check: run options persistence OK")
+                else:
+                    checks_ok = False
+                    self._log(
+                        "Self-check: run options persistence failed (sentinel mismatch)"
+                    )
+                self._pm_meta_set(key, previous_value)
+            except Exception as e:
+                checks_ok = False
+                self._log(f"Self-check: run options persistence error: {e}")
+
+        if checks_ok:
+            self._set_status("Self-check passed")
+            self._log("Self-check: completed")
+        else:
+            self._set_status("Self-check completed with issues")
+            self._log("Self-check: completed with issues")
 
     def _clear_log(self) -> None:
         """Clear the log output."""
@@ -592,3 +1647,32 @@ class SyncDialog(QDialog):
         """Update the progress bar."""
         self.progress_bar.setMaximum(maximum)
         self.progress_bar.setValue(value)
+
+    def _set_busy_progress(self, busy: bool) -> None:
+        if busy:
+            try:
+                self.progress_bar.setRange(0, 0)
+            except Exception:
+                self.progress_bar.setMaximum(0)
+                self.progress_bar.setValue(0)
+        else:
+            self.progress_bar.setRange(0, 100)
+
+    def _set_ui_running(self, running: bool) -> None:
+        widgets = [
+            self.profile_combo,
+            self.manage_profiles_btn,
+            self.dry_run_btn,
+            self.apply_btn,
+            self.self_check_btn,
+            self.ambiguous_combo,
+            self.aggregation_combo,
+            self.scheduling_combo,
+        ]
+        for w in widgets:
+            try:
+                w.setEnabled(not running)
+            except Exception:
+                continue
+        if not running:
+            self._update_button_states()
