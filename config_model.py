@@ -43,11 +43,13 @@ class LingqToAnkiMapping:
     """Mapping definition for writing LingQ data into Anki.
 
     - note_type: Anki note type to create/update (e.g. "Basic").
+    - deck_name: Optional Anki deck name to create notes in.
     - field_mapping: LingQ field name -> Anki field name.
     - identity_fields: Anki field names used for identity tracking.
     """
 
     note_type: str
+    deck_name: Optional[str] = None
     field_mapping: Dict[str, str] = field(default_factory=dict)
     identity_fields: IdentityFields = field(default_factory=IdentityFields)
 
@@ -59,27 +61,32 @@ class AnkiToLingqMapping:
     - term_field: Name of the Anki field containing the term.
     - translation_fields: Names of Anki fields containing translations.
     - primary_card_template: Optional card template name used as primary.
+    - fragment_field: Optional Anki field containing example usage/source text.
     """
 
     term_field: str
     translation_fields: List[str] = field(default_factory=list)
     primary_card_template: Optional[str] = None
+    fragment_field: Optional[str] = None
 
 
 @dataclass
 class Profile:
     """A single LingQ-Anki sync profile.
 
-    A profile groups together locale/language choices, token reference, and the
-    bidirectional mappings required to sync between LingQ and Anki.
+    A profile groups together locale/language choices, the LingQ API token, and
+    the bidirectional mappings required to sync between LingQ and Anki.
     """
 
     name: str
     lingq_language: str
     meaning_locale: str
-    api_token_ref: str
     lingq_to_anki: LingqToAnkiMapping
     anki_to_lingq: AnkiToLingqMapping
+    api_token: str = ""
+    # Backward compat: legacy configs/tests may still set `api_token_ref`.
+    # This is no longer persisted; `api_token` is the canonical field.
+    api_token_ref: str = ""
     enable_scheduling_writes: bool = False
 
 

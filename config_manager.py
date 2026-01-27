@@ -27,8 +27,44 @@ aqt = importlib.import_module("aqt")
 mw = aqt.mw
 
 
+def _addon_root_name() -> str:
+    """Return the add-on root package name for Anki config keys.
+
+    When this module is imported from a submodule (e.g. package.sub.module),
+    using __name__ will point at the submodule and break config persistence.
+    Anki stores add-on config under the add-on's root package key.
+    """
+
+    package = __package__ or ""
+    if package:
+        return package.split(".", 1)[0]
+
+    name = __name__ or ""
+    if name:
+        return name.split(".", 1)[0]
+
+    # Extremely defensive fallback; should not happen in normal imports.
+    return "lingq_anki"
+
+
+_ADDON_CONFIG_KEY = _addon_root_name()
+
+
 def config_to_dict(config: Config) -> dict:
-    return asdict(config)
+    data = asdict(config)
+
+    # Migration/output schema: persist the actual token under `api_token`.
+    # Keep `api_token_ref` as a runtime-only backward-compat field.
+    raw_profiles = data.get("profiles")
+    if isinstance(raw_profiles, list):
+        for p in raw_profiles:
+            if not isinstance(p, dict):
+                continue
+            if "api_token" not in p and "api_token_ref" in p:
+                p["api_token"] = p.get("api_token_ref", "")
+            p.pop("api_token_ref", None)
+
+    return data
 
 
 def dict_to_config(data: dict) -> Config:
@@ -57,8 +93,14 @@ def dict_to_config(data: dict) -> Config:
             identity_data = {}
         identity_fields = IdentityFields(**identity_data)
 
+        deck_raw = l2a_data.get("deck_name")
+        deck_name = None
+        if deck_raw is not None:
+            deck_name = str(deck_raw).strip() or None
+
         lingq_to_anki = LingqToAnkiMapping(
             note_type=str(l2a_data["note_type"]),
+            deck_name=deck_name,
             field_mapping=_coerce_str_dict(l2a_data.get("field_mapping", {})),
             identity_fields=identity_fields,
         )
@@ -79,16 +121,27 @@ def dict_to_config(data: dict) -> Config:
                 if a2l_data.get("primary_card_template") is None
                 else str(a2l_data.get("primary_card_template"))
             ),
+            fragment_field=(
+                None
+                if a2l_data.get("fragment_field") is None
+                else str(a2l_data.get("fragment_field"))
+            ),
         )
+
+        api_token_value = p.get("api_token")
+        if api_token_value is None:
+            api_token_value = p.get("api_token_ref", "")
 
         profiles.append(
             Profile(
                 name=str(p["name"]),
                 lingq_language=str(p["lingq_language"]),
                 meaning_locale=str(p["meaning_locale"]),
-                api_token_ref=str(p["api_token_ref"]),
                 lingq_to_anki=lingq_to_anki,
                 anki_to_lingq=anki_to_lingq,
+                api_token=str(api_token_value or ""),
+                # Backward compat: allow older code/tests to keep using this.
+                api_token_ref=str(api_token_value or ""),
                 enable_scheduling_writes=bool(p.get("enable_scheduling_writes", False)),
             )
         )
@@ -98,18 +151,37 @@ def dict_to_config(data: dict) -> Config:
 
 def load_config() -> Config:
     try:
-        data = mw.addonManager.getConfig(__name__)
+        data = mw.addonManager.getConfig(_ADDON_CONFIG_KEY)
     except Exception:
         return Config()
 
     try:
-        return dict_to_config(data or {})
+        config = dict_to_config(data or {})
+
+        # Backwards-compatible migration: if loaded config only had
+        # `api_token_ref`, rewrite it back as `api_token`.
+        raw_profiles = (data or {}).get("profiles") if isinstance(data, dict) else None
+        migrate_tokens = False
+        if isinstance(raw_profiles, list):
+            for p in raw_profiles:
+                if not isinstance(p, dict):
+                    continue
+                if "api_token" not in p and "api_token_ref" in p:
+                    migrate_tokens = True
+                    break
+        if migrate_tokens:
+            try:
+                save_config(config)
+            except Exception:
+                pass
+
+        return config
     except Exception:
         return Config()
 
 
 def save_config(config: Config) -> None:
-    mw.addonManager.writeConfig(__name__, config_to_dict(config))
+    mw.addonManager.writeConfig(_ADDON_CONFIG_KEY, config_to_dict(config))
 
 
 def _coerce_str_dict(value: Any) -> Dict[str, str]:
