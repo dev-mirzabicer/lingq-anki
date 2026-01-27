@@ -69,7 +69,46 @@ class ApplyResult:
 
 
 def _checkpoint_path(profile_name: str) -> Path:
-    return Path(f".lingq_sync_checkpoint_{profile_name}.json")
+    """Return a writable checkpoint path.
+
+    In Anki, the add-on directory may be read-only. Prefer the current Anki
+    profile folder when available.
+    """
+
+    safe = (
+        "".join(
+            c if (c.isalnum() or c in {"-", "_"}) else "_"
+            for c in str(profile_name or "")
+        ).strip("_")
+        or "default"
+    )
+
+    # Optional override (useful for debugging).
+    override = os.environ.get("LINGQ_SYNC_CHECKPOINT_DIR")
+    if isinstance(override, str) and override.strip():
+        base = Path(override).expanduser()
+        return base / f"lingq_sync_checkpoint_{safe}.json"
+
+    # Prefer Anki's profile folder when running inside Anki.
+    try:
+        from aqt import mw  # type: ignore
+
+        pm = getattr(mw, "pm", None)
+        profile_dir = None
+        if pm is not None:
+            # Anki has had both camelCase and snake_case in different versions.
+            if hasattr(pm, "profileFolder"):
+                profile_dir = pm.profileFolder()  # type: ignore[attr-defined]
+            elif hasattr(pm, "profile_folder"):
+                profile_dir = pm.profile_folder()  # type: ignore[attr-defined]
+        if isinstance(profile_dir, str) and profile_dir:
+            base = Path(profile_dir) / "lingq-sync"
+            return base / f"checkpoint_{safe}.json"
+    except Exception:
+        pass
+
+    # Fallback: current working directory (tests/CLI).
+    return Path(f".lingq_sync_checkpoint_{safe}.json")
 
 
 def load_checkpoint(profile_name: str) -> Optional[Checkpoint]:
@@ -111,6 +150,13 @@ def load_checkpoint(profile_name: str) -> Optional[Checkpoint]:
 def save_checkpoint(profile_name: str, checkpoint: Checkpoint) -> None:
     path = _checkpoint_path(profile_name)
     tmp = Path(str(path) + ".tmp")
+
+    # Ensure target directory exists.
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # If directory creation fails, let write_text raise a clearer error.
+        pass
 
     payload = {
         "run_id": checkpoint.run_id,
@@ -161,6 +207,15 @@ def _hints_for_op(op: SyncOperation) -> List[Dict[str, Any]]:
     if isinstance(hints, list) and all(isinstance(x, dict) for x in hints):
         return list(hints)  # type: ignore[return-value]
     return []
+
+
+def _parse_int(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
 
 
 def _apply_link(op: SyncOperation) -> bool:
@@ -271,8 +326,49 @@ def _apply_create_anki(op: SyncOperation) -> bool:
         if fname not in model_fields:
             raise ValueError(f"Field {fname!r} not in note type {note_type!r}")
 
-    deck_name = str(op.details.get("deck") or "Default").strip() or "Default"
-    deck_id = mw.col.decks.id(deck_name)
+    # Choose a target deck.
+    # IMPORTANT: do not call decks.id("Default") as a fallback, as it will create
+    # a new deck if it doesn't exist.
+    deck_id = None
+    raw_deck_id = op.details.get("deck_id")
+    if isinstance(raw_deck_id, int) and raw_deck_id > 0:
+        deck_id = raw_deck_id
+    else:
+        deck_name = op.details.get("deck")
+        if isinstance(deck_name, str) and deck_name.strip():
+            # This can create the deck if missing; only do it when user explicitly provided a deck.
+            deck_id = int(mw.col.decks.id(deck_name.strip()))
+
+    if deck_id is None:
+        # Prefer the deck the user currently has selected.
+        try:
+            deck_id = int(mw.col.decks.selected())
+        except Exception:
+            deck_id = None
+
+    if deck_id is None:
+        # Fallback: current deck dict.
+        try:
+            cur = mw.col.decks.current()
+            if isinstance(cur, dict) and "id" in cur:
+                deck_id = int(cur["id"])
+        except Exception:
+            deck_id = None
+
+    if deck_id is None:
+        # Last resort: respect user's add defaults if available.
+        try:
+            reviewer = getattr(mw, "reviewer", None)
+            current_review_card = getattr(reviewer, "card", None) if reviewer else None
+            defaults = mw.col.defaults_for_adding(
+                current_review_card=current_review_card
+            )
+            deck_id = int(getattr(defaults, "deck_id"))
+        except Exception:
+            deck_id = None
+
+    if deck_id is None:
+        raise ValueError("Could not determine target deck for OP_CREATE_ANKI")
 
     note = mw.col.new_note(model)
     for fname, value in fields.items():
@@ -366,14 +462,75 @@ def _apply_create_lingq(op: SyncOperation, client: LingQClient) -> None:
         raise ValueError("create_lingq missing term")
 
     existing = client.search_cards(language, op.term)
+    matches: List[Dict[str, Any]] = []
     for card in existing:
         term = card.get("term")
         if isinstance(term, str) and term.strip().lower() == op.term.strip().lower():
-            # Idempotent: card already exists.
+            # card is a TypedDict; convert for type checkers.
+            matches.append(dict(card))
+
+    created_pk: Optional[int] = None
+    if len(matches) > 1:
+        raise ValueError(
+            f"create_lingq ambiguous: multiple existing LingQ cards match term {op.term!r}"
+        )
+    if len(matches) == 1:
+        created_pk = _parse_int(matches[0].get("pk"))
+
+    if created_pk is None:
+        hints = _hints_for_op(op)
+        fragment = None
+        if isinstance(op.details, dict):
+            frag = op.details.get("fragment")
+            if isinstance(frag, str) and frag.strip():
+                fragment = frag.strip()
+        created = client.create_card(language, op.term, hints, fragment=fragment)  # type: ignore[arg-type]
+        created_pk = _parse_int((created or {}).get("pk"))
+
+    # Optional: set status after creation to reflect Anki progress.
+    if isinstance(op.details, dict) and created_pk is not None:
+        desired = op.details.get("desired_status")
+        if isinstance(desired, int) and 0 <= desired <= 4:
+            try:
+                client.patch_card(language, created_pk, {"status": int(desired)})
+            except Exception:
+                # Best-effort: status update is non-critical.
+                pass
+
+    # If running inside Anki, backfill the PK into the originating note.
+    if _is_anki_runtime() and created_pk is not None and op.anki_note_id is not None:
+        if not isinstance(op.details, dict):
+            return
+        identity_fields = op.details.get("identity_fields")
+        identity_values = op.details.get("identity_values")
+        if not isinstance(identity_fields, dict) or not isinstance(
+            identity_values, dict
+        ):
+            return
+        pk_field = identity_fields.get("pk_field")
+        canon_field = identity_fields.get("canonical_term_field")
+        canon_value = str(identity_values.get("canonical_term_value") or "")
+        if not (
+            isinstance(pk_field, str)
+            and pk_field.strip()
+            and isinstance(canon_field, str)
+            and canon_field.strip()
+        ):
             return
 
-    hints = _hints_for_op(op)
-    client.create_card(language, op.term, hints)  # type: ignore[arg-type]
+        from aqt import mw
+
+        note = mw.col.get_note(int(op.anki_note_id))
+        existing_pk = str(note[pk_field] or "").strip()
+        if existing_pk and existing_pk != str(created_pk):
+            raise ValueError(
+                f"PK conflict: note has {existing_pk}, trying to set {created_pk}"
+            )
+        if not existing_pk:
+            note[pk_field] = str(created_pk)
+        if canon_value and str(note[canon_field] or "").strip() != canon_value:
+            note[canon_field] = canon_value
+        mw.col.update_note(note)
 
 
 def _apply_update_hints(op: SyncOperation, client: LingQClient) -> None:
