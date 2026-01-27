@@ -42,6 +42,19 @@ class SchedulingWritePolicy(_StrEnum):
     FORCE_OFF = "FORCE_OFF"
 
 
+class ProgressAuthorityPolicy(_StrEnum):
+    """Which side should be treated as the authority for progress decisions.
+
+    - AUTOMATIC: current heuristic (based on reviews + LingQ tier)
+    - PREFER_ANKI: if Anki has reviews, never reschedule from LingQ; update LingQ from Anki only
+    - PREFER_LINGQ: allow LingQ to drive scheduling even if Anki has reviews (use with care)
+    """
+
+    AUTOMATIC = "AUTOMATIC"
+    PREFER_ANKI = "PREFER_ANKI"
+    PREFER_LINGQ = "PREFER_LINGQ"
+
+
 @dataclass
 class RunOptions:
     """Per-run options that control sync behavior.
@@ -54,6 +67,9 @@ class RunOptions:
         TranslationAggregationPolicy.UNSET
     )
     scheduling_write_policy: SchedulingWritePolicy = SchedulingWritePolicy.UNSET
+    progress_authority_policy: ProgressAuthorityPolicy = (
+        ProgressAuthorityPolicy.AUTOMATIC
+    )
 
 
 RUN_OPTIONS_SCHEMA_VERSION = 1
@@ -114,6 +130,17 @@ def validate_run_options(opts: RunOptions) -> List[str]:
             "Scheduling write policy must be one of INHERIT_PROFILE/FORCE_ON/FORCE_OFF."
         )
 
+    auth = getattr(opts, "progress_authority_policy", None)
+    allowed_auth = {
+        ProgressAuthorityPolicy.AUTOMATIC,
+        ProgressAuthorityPolicy.PREFER_ANKI,
+        ProgressAuthorityPolicy.PREFER_LINGQ,
+    }
+    if not isinstance(auth, ProgressAuthorityPolicy) or auth not in allowed_auth:
+        errors.append(
+            "Progress authority must be one of AUTOMATIC/PREFER_ANKI/PREFER_LINGQ."
+        )
+
     return errors
 
 
@@ -125,6 +152,7 @@ def run_options_to_dict(opts: RunOptions) -> Dict[str, Any]:
             opts.translation_aggregation_policy.value
         ),
         "scheduling_write_policy": str(opts.scheduling_write_policy.value),
+        "progress_authority_policy": str(opts.progress_authority_policy.value),
     }
 
 
@@ -145,5 +173,10 @@ def dict_to_run_options(d: Mapping[str, Any]) -> RunOptions:
             SchedulingWritePolicy,
             src.get("scheduling_write_policy"),
             default=SchedulingWritePolicy.UNSET,
+        ),
+        progress_authority_policy=_parse_enum(
+            ProgressAuthorityPolicy,
+            src.get("progress_authority_policy"),
+            default=ProgressAuthorityPolicy.AUTOMATIC,
         ),
     )

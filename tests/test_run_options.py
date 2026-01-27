@@ -13,6 +13,7 @@ sys.modules.setdefault("aqt.gui_hooks", mock_aqt.gui_hooks)
 
 from run_options import (  # noqa: E402
     AmbiguousMatchPolicy,
+    ProgressAuthorityPolicy,
     RunOptions,
     SchedulingWritePolicy,
     TranslationAggregationPolicy,
@@ -75,6 +76,7 @@ def test_run_options_to_dict_round_trip_preserves_values():
         ambiguous_match_policy=AmbiguousMatchPolicy.AGGRESSIVE_LINK_FIRST,
         translation_aggregation_policy=TranslationAggregationPolicy.AVG,
         scheduling_write_policy=SchedulingWritePolicy.FORCE_ON,
+        progress_authority_policy=ProgressAuthorityPolicy.PREFER_ANKI,
     )
 
     raw = run_options_to_dict(opts)
