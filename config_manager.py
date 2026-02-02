@@ -181,7 +181,19 @@ def load_config() -> Config:
 
 
 def save_config(config: Config) -> None:
-    mw.addonManager.writeConfig(_ADDON_CONFIG_KEY, config_to_dict(config))
+    # Preserve any extra keys stored in the add-on config dict (e.g. UI state).
+    new_data = config_to_dict(config)
+    try:
+        existing = mw.addonManager.getConfig(_ADDON_CONFIG_KEY)
+    except Exception:
+        existing = None
+
+    if isinstance(existing, dict):
+        for k, v in existing.items():
+            if k not in new_data:
+                new_data[k] = v
+
+    mw.addonManager.writeConfig(_ADDON_CONFIG_KEY, new_data)
 
 
 def _coerce_str_dict(value: Any) -> Dict[str, str]:

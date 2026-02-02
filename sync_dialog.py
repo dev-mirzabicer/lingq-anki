@@ -491,6 +491,83 @@ class SyncDialog(QDialog):
     def _get_run_options_meta_key(self, profile_name: str) -> str:
         return f"lingq_sync:last_run_options:{profile_name}"
 
+    def _get_addon_config_key(self) -> str:
+        # Prefer the shared config_manager key to avoid package/submodule issues.
+        try:
+            try:
+                from . import config_manager
+            except ImportError:
+                import config_manager  # type: ignore
+            key = getattr(config_manager, "_ADDON_CONFIG_KEY", None)
+            if isinstance(key, str) and key.strip():
+                return key.strip()
+        except Exception:
+            pass
+
+        package = __package__ or ""
+        if package:
+            return package.split(".", 1)[0]
+        name = __name__ or ""
+        return name.split(".", 1)[0] if name else "lingq_sync"
+
+    def _addon_config_get(self) -> Dict[str, Any]:
+        try:
+            from aqt import mw
+
+            if not mw or not getattr(mw, "addonManager", None):
+                return {}
+            data = mw.addonManager.getConfig(self._get_addon_config_key())
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _addon_config_set(self, data: Dict[str, Any]) -> None:
+        try:
+            from aqt import mw
+
+            if not mw or not getattr(mw, "addonManager", None):
+                return
+            if not isinstance(data, dict):
+                return
+            mw.addonManager.writeConfig(self._get_addon_config_key(), data)
+        except Exception:
+            return
+
+    def _fill_run_options_defaults(self, opts: RunOptions) -> RunOptions:
+        """Fill missing/UNSET fields from safe defaults.
+
+        This prevents older saved dicts (or partial state) from forcing the user
+        to re-select options repeatedly.
+        """
+
+        defaults = self._get_safe_default_run_options()
+        if (
+            getattr(opts, "ambiguous_match_policy", AmbiguousMatchPolicy.UNSET)
+            == AmbiguousMatchPolicy.UNSET
+        ):
+            opts.ambiguous_match_policy = defaults.ambiguous_match_policy
+        if (
+            getattr(
+                opts,
+                "translation_aggregation_policy",
+                TranslationAggregationPolicy.UNSET,
+            )
+            == TranslationAggregationPolicy.UNSET
+        ):
+            opts.translation_aggregation_policy = (
+                defaults.translation_aggregation_policy
+            )
+        if (
+            getattr(opts, "scheduling_write_policy", SchedulingWritePolicy.UNSET)
+            == SchedulingWritePolicy.UNSET
+        ):
+            opts.scheduling_write_policy = defaults.scheduling_write_policy
+        if not isinstance(
+            getattr(opts, "progress_authority_policy", None), ProgressAuthorityPolicy
+        ):
+            opts.progress_authority_policy = defaults.progress_authority_policy
+        return opts
+
     def _pm_meta_get(self, key: str, default=None):
         try:
             from aqt import mw
@@ -533,8 +610,25 @@ class SyncDialog(QDialog):
         profile = self._get_selected_profile()
         if not profile:
             return
+
+        payload = run_options_to_dict(self._run_options)
+
+        # Prefer add-on config persistence (survives restarts, and survives ConfigDialog saves).
+        config = self._addon_config_get()
+        ui_state = config.get("ui_state") if isinstance(config, dict) else None
+        if not isinstance(ui_state, dict):
+            ui_state = {}
+        last = ui_state.get("last_run_options")
+        if not isinstance(last, dict):
+            last = {}
+        last[str(profile.name)] = payload
+        ui_state["last_run_options"] = last
+        config["ui_state"] = ui_state
+        self._addon_config_set(config)
+
+        # Back-compat: also attempt profile meta.
         key = self._get_run_options_meta_key(profile.name)
-        self._pm_meta_set(key, run_options_to_dict(self._run_options))
+        self._pm_meta_set(key, payload)
 
     def _load_run_options_for_profile(self) -> None:
         profile = self._get_selected_profile()
@@ -544,16 +638,34 @@ class SyncDialog(QDialog):
             return
 
         loaded_opts: Optional[RunOptions] = None
-        key = self._get_run_options_meta_key(profile.name)
-        saved = self._pm_meta_get(key, None)
-        if saved:
-            try:
+
+        # 1) Try add-on config ui_state
+        try:
+            config = self._addon_config_get()
+            ui_state = config.get("ui_state") if isinstance(config, dict) else None
+            last = (
+                ui_state.get("last_run_options") if isinstance(ui_state, dict) else None
+            )
+            saved = last.get(str(profile.name)) if isinstance(last, dict) else None
+            if saved:
                 loaded_opts = dict_to_run_options(saved)
-            except Exception:
-                loaded_opts = None
+        except Exception:
+            loaded_opts = None
+
+        # 2) Fallback: profile meta
+        if loaded_opts is None:
+            key = self._get_run_options_meta_key(profile.name)
+            saved = self._pm_meta_get(key, None)
+            if saved:
+                try:
+                    loaded_opts = dict_to_run_options(saved)
+                except Exception:
+                    loaded_opts = None
 
         if loaded_opts is None:
             loaded_opts = self._get_safe_default_run_options()
+
+        loaded_opts = self._fill_run_options_defaults(loaded_opts)
 
         self._run_options = loaded_opts
         self._sync_combos_from_run_options()
