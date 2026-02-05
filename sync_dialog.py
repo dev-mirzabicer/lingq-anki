@@ -1803,6 +1803,103 @@ class SyncDialog(QDialog):
         else:
             self._resolve_generic_conflict(op, idx, conflict_type)
 
+    @staticmethod
+    def _ellipsize(text: str, max_len: int = 60) -> str:
+        text = text.strip()
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 1].rstrip() + "\u2026"
+
+    def _build_note_preview(self, nid: int, profile: "Profile") -> tuple[str, str]:
+        """Return (primary_line, secondary_line) for a note in the duplicate-PK dialog.
+
+        primary_line: term + optional translation snippet.
+        secondary_line: deck name, note-type name, note id (all best-effort).
+        Safe against missing fields/collection — never raises.
+        """
+        term_text = ""
+        translation_text = ""
+        deck_name = ""
+        note_type_name = ""
+
+        try:
+            from aqt import mw as _mw
+
+            if _mw and getattr(_mw, "col", None):
+                note = _mw.col.get_note(nid)
+
+                try:
+                    term_field = str(
+                        getattr(profile.anki_to_lingq, "term_field", "") or ""
+                    ).strip()
+                    if term_field:
+                        term_text = str(note[term_field] or "").strip()
+                except Exception:
+                    pass
+
+                try:
+                    translation_fields = list(
+                        getattr(profile.anki_to_lingq, "translation_fields", []) or []
+                    )
+                    snippets: list[str] = []
+                    for tf in translation_fields:
+                        tf = str(tf or "").strip()
+                        if not tf:
+                            continue
+                        try:
+                            val = str(note[tf] or "").strip()
+                        except Exception:
+                            continue
+                        if val:
+                            snippets.append(val)
+                        if len(snippets) >= 2:
+                            break
+                    if snippets:
+                        translation_text = "; ".join(snippets)
+                except Exception:
+                    pass
+
+                try:
+                    cards = note.cards()
+                    if cards:
+                        primary_card = min(cards, key=lambda c: getattr(c, "ord", 0))
+                        deck_id = getattr(primary_card, "did", None)
+                        if deck_id is not None:
+                            deck_name = str(_mw.col.decks.name(deck_id) or "").strip()
+                except Exception:
+                    pass
+
+                try:
+                    model = getattr(note, "model", None)
+                    if callable(model):
+                        model = model()
+                    if model and isinstance(model, dict):
+                        note_type_name = str(model.get("name", "") or "").strip()
+                    else:
+                        mid = getattr(note, "mid", None)
+                        if mid is not None:
+                            m = _mw.col.models.get(mid)
+                            if m:
+                                note_type_name = str(m.get("name", "") or "").strip()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        primary = self._ellipsize(term_text, 50) if term_text else "(no term)"
+        if translation_text:
+            primary += " \u2014 " + self._ellipsize(translation_text, 50)
+
+        parts: list[str] = []
+        if deck_name:
+            parts.append(deck_name)
+        if note_type_name:
+            parts.append(note_type_name)
+        parts.append(f"ID {nid}")
+        secondary = "  \u00b7  ".join(parts)
+
+        return primary, secondary
+
     def _resolve_duplicate_pk(self, op: Any, conflict_idx: int) -> None:
         profile = self._get_selected_profile()
         if not profile:
@@ -1841,7 +1938,7 @@ class SyncDialog(QDialog):
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Resolve Duplicate PK")
-        dialog.setMinimumWidth(420)
+        dialog.setMinimumWidth(480)
         dlg_layout = QVBoxLayout(dialog)
         dlg_layout.setSpacing(12)
         dlg_layout.setContentsMargins(20, 16, 20, 16)
@@ -1864,30 +1961,30 @@ class SyncDialog(QDialog):
         default_nid = int(op.anki_note_id) if op.anki_note_id else None
 
         for nid in matching_nids:
-            preview = f"Note #{nid}"
-            try:
-                from aqt import mw as _mw
+            primary_text, secondary_text = self._build_note_preview(nid, profile)
 
-                note = _mw.col.get_note(nid)
-                term_field = str(
-                    getattr(profile.anki_to_lingq, "term_field", "") or ""
-                ).strip()
-                if term_field:
-                    term_val = str(note[term_field] or "").strip()
-                    if term_val:
-                        preview = f"Note #{nid} \u2014 {term_val}"
-            except Exception:
-                pass
+            option_widget = QWidget()
+            option_layout = QVBoxLayout(option_widget)
+            option_layout.setContentsMargins(0, 4, 0, 4)
+            option_layout.setSpacing(1)
 
-            radio = QRadioButton(preview)
-            radio.setStyleSheet(
-                "font-size: 12px; color: palette(text); padding: 4px 0;"
-            )
+            radio = QRadioButton(primary_text)
+            radio.setStyleSheet("font-size: 13px; color: palette(text); padding: 0;")
             radio.setProperty("nid", nid)
             if nid == default_nid:
                 radio.setChecked(True)
             btn_group.addButton(radio)
-            dlg_layout.addWidget(radio)
+            option_layout.addWidget(radio)
+
+            meta_label = QLabel(secondary_text)
+            meta_label.setStyleSheet(
+                "font-size: 11px; color: palette(window-text);"
+                " padding-left: 22px; opacity: 0.65;"
+            )
+            meta_label.setWordWrap(False)
+            option_layout.addWidget(meta_label)
+
+            dlg_layout.addWidget(option_widget)
 
         if not btn_group.checkedButton() and btn_group.buttons():
             btn_group.buttons()[0].setChecked(True)
