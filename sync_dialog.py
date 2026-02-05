@@ -81,6 +81,8 @@ QAbstractItemView = qt.QAbstractItemView
 QScrollArea = qt.QScrollArea
 QWidget = qt.QWidget
 QMessageBox = qt.QMessageBox
+QRadioButton = qt.QRadioButton
+QButtonGroup = qt.QButtonGroup
 
 # Import table widget separately for clarity
 _QTableWidget = qt.QTableWidget
@@ -96,6 +98,7 @@ class SyncDialog(QDialog):
         self.setMinimumSize(600, 500)
 
         self._current_plan: Optional["SyncPlan"] = None
+        self._current_conflicts: List[Any] = []
         self._profiles: List["Profile"] = []
         self._run_options: RunOptions = self._get_safe_default_run_options()
 
@@ -891,7 +894,7 @@ class SyncDialog(QDialog):
         return frame, value_label
 
     def _create_conflicts_section(self) -> QVBoxLayout:
-        """Create conflicts list display."""
+        """Create conflicts list display with Resolve button."""
         layout = QVBoxLayout()
         layout.setSpacing(8)
 
@@ -902,6 +905,40 @@ class SyncDialog(QDialog):
         )
         header_layout.addWidget(self.conflicts_header)
         header_layout.addStretch()
+
+        self.resolve_hint_label = QLabel("Select a conflict and click Resolve\u2026")
+        self.resolve_hint_label.setStyleSheet(
+            "font-size: 11px; color: palette(window-text); opacity: 0.6;"
+        )
+        self.resolve_hint_label.hide()
+        header_layout.addWidget(self.resolve_hint_label)
+
+        self.resolve_btn = QPushButton("Resolve\u2026")
+        self.resolve_btn.setEnabled(False)
+        self.resolve_btn.setStyleSheet("""
+            QPushButton {
+                padding: 5px 14px;
+                background: palette(button);
+                border: 1px solid palette(mid);
+                border-radius: 5px;
+                font-weight: 600;
+                color: palette(button-text);
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background: palette(light);
+                border-color: palette(dark);
+            }
+            QPushButton:pressed {
+                background: palette(midlight);
+            }
+            QPushButton:disabled {
+                background: palette(window);
+                color: palette(mid);
+            }
+        """)
+        self.resolve_btn.clicked.connect(self._on_resolve_conflict)
+        header_layout.addWidget(self.resolve_btn)
 
         layout.addLayout(header_layout)
 
@@ -942,6 +979,10 @@ class SyncDialog(QDialog):
                 padding: 6px 8px;
                 color: palette(text);
             }
+            QTableWidget::item:selected {
+                background: palette(highlight);
+                color: palette(highlighted-text);
+            }
             QHeaderView::section {
                 background: palette(button);
                 border: none;
@@ -951,6 +992,9 @@ class SyncDialog(QDialog):
                 color: palette(button-text);
             }
         """)
+        self.conflicts_table.itemSelectionChanged.connect(
+            self._on_conflict_selection_changed
+        )
 
         layout.addWidget(self.conflicts_table)
 
@@ -1116,6 +1160,9 @@ class SyncDialog(QDialog):
         self.apply_btn.setEnabled(
             has_profile and has_plan and (not has_conflicts) and run_options_valid
         )
+
+        self.resolve_hint_label.setVisible(has_conflicts)
+        self._on_conflict_selection_changed()
 
     # === Event Handlers ===
 
@@ -1726,6 +1773,458 @@ class SyncDialog(QDialog):
             self._set_status("Self-check completed with issues")
             self._log("Self-check: completed with issues")
 
+    # === Conflict Resolution ===
+
+    def _on_conflict_selection_changed(self) -> None:
+        selected_rows = self.conflicts_table.selectionModel().selectedRows()
+        has_selection = len(selected_rows) > 0 and len(self._current_conflicts) > 0
+        self.resolve_btn.setEnabled(has_selection)
+
+    def _get_selected_conflict_index(self) -> Optional[int]:
+        selected_rows = self.conflicts_table.selectionModel().selectedRows()
+        if not selected_rows:
+            return None
+        row = selected_rows[0].row()
+        if 0 <= row < len(self._current_conflicts):
+            return row
+        return None
+
+    def _on_resolve_conflict(self) -> None:
+        idx = self._get_selected_conflict_index()
+        if idx is None:
+            self._log("No conflict selected")
+            return
+
+        op = self._current_conflicts[idx]
+        conflict_type = op.details.get("conflict_type", "unknown")
+
+        if conflict_type == "duplicate_pk":
+            self._resolve_duplicate_pk(op, idx)
+        else:
+            self._resolve_generic_conflict(op, idx, conflict_type)
+
+    def _resolve_duplicate_pk(self, op: Any, conflict_idx: int) -> None:
+        profile = self._get_selected_profile()
+        if not profile:
+            self._log("No profile selected")
+            return
+
+        pk_field = str(profile.lingq_to_anki.identity_fields.pk_field or "").strip()
+        canonical_field = str(
+            profile.lingq_to_anki.identity_fields.canonical_term_field or ""
+        ).strip()
+        lingq_pk = str(op.lingq_pk or "")
+
+        if not pk_field or not lingq_pk:
+            self._log("Cannot resolve: missing PK field or LingQ PK value")
+            return
+
+        try:
+            from aqt import mw
+
+            if not mw or not getattr(mw, "col", None):
+                self._log("Cannot resolve: Anki collection not available")
+                return
+            matching_nids = [
+                int(x) for x in mw.col.find_notes(f"{pk_field}:{lingq_pk}")
+            ]
+        except Exception as e:
+            self._log(f"Cannot resolve: failed to search Anki notes: {e}")
+            return
+
+        if len(matching_nids) < 2:
+            self._log(
+                f"Only {len(matching_nids)} note(s) found with {pk_field}={lingq_pk}. "
+                "Re-run Dry Run to refresh."
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Resolve Duplicate PK")
+        dialog.setMinimumWidth(420)
+        dlg_layout = QVBoxLayout(dialog)
+        dlg_layout.setSpacing(12)
+        dlg_layout.setContentsMargins(20, 16, 20, 16)
+
+        explanation = QLabel(
+            f"Multiple Anki notes share the same LingQ PK "
+            f"<b>{lingq_pk}</b> in field <b>{pk_field}</b>.\n\n"
+            f"Choose which note keeps the PK. The others will have "
+            f"their <b>{pk_field}</b>"
+            + (f" and <b>{canonical_field}</b>" if canonical_field else "")
+            + " fields cleared."
+        )
+        explanation.setWordWrap(True)
+        explanation.setStyleSheet(
+            "font-size: 12px; color: palette(window-text); padding-bottom: 4px;"
+        )
+        dlg_layout.addWidget(explanation)
+
+        btn_group = QButtonGroup(dialog)
+        default_nid = int(op.anki_note_id) if op.anki_note_id else None
+
+        for nid in matching_nids:
+            preview = f"Note #{nid}"
+            try:
+                from aqt import mw as _mw
+
+                note = _mw.col.get_note(nid)
+                term_field = str(
+                    getattr(profile.anki_to_lingq, "term_field", "") or ""
+                ).strip()
+                if term_field:
+                    term_val = str(note[term_field] or "").strip()
+                    if term_val:
+                        preview = f"Note #{nid} \u2014 {term_val}"
+            except Exception:
+                pass
+
+            radio = QRadioButton(preview)
+            radio.setStyleSheet(
+                "font-size: 12px; color: palette(text); padding: 4px 0;"
+            )
+            radio.setProperty("nid", nid)
+            if nid == default_nid:
+                radio.setChecked(True)
+            btn_group.addButton(radio)
+            dlg_layout.addWidget(radio)
+
+        if not btn_group.checkedButton() and btn_group.buttons():
+            btn_group.buttons()[0].setChecked(True)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet("""
+            QPushButton {
+                padding: 8px 18px;
+                background: transparent;
+                border: 1px solid palette(mid);
+                border-radius: 5px;
+                font-size: 12px;
+                color: palette(window-text);
+            }
+            QPushButton:hover { background: palette(button); }
+        """)
+        cancel_btn.clicked.connect(dialog.reject)
+        button_row.addWidget(cancel_btn)
+
+        confirm_btn = QPushButton("Confirm")
+        confirm_btn.setStyleSheet("""
+            QPushButton {
+                padding: 8px 18px;
+                background: palette(highlight);
+                border: none;
+                border-radius: 5px;
+                font-weight: 600;
+                font-size: 12px;
+                color: palette(highlighted-text);
+            }
+            QPushButton:hover { background: palette(highlight); }
+        """)
+        confirm_btn.clicked.connect(dialog.accept)
+        button_row.addWidget(confirm_btn)
+
+        dlg_layout.addLayout(button_row)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        checked = btn_group.checkedButton()
+        if not checked:
+            return
+        keep_nid = int(checked.property("nid"))
+        clear_nids = [n for n in matching_nids if n != keep_nid]
+
+        self._log(
+            f"Resolving duplicate_pk: keeping PK on note #{keep_nid}, "
+            f"clearing {len(clear_nids)} other note(s)"
+        )
+
+        self._run_duplicate_pk_fix(clear_nids, pk_field, canonical_field)
+
+    def _run_duplicate_pk_fix(
+        self, clear_nids: List[int], pk_field: str, canonical_field: str
+    ) -> None:
+        self._set_status("Resolving duplicate PK\u2026")
+        self._set_busy_progress(True)
+
+        def call_on_main(fn: Callable[[], None]) -> None:
+            try:
+                from aqt import mw
+
+                tm = getattr(mw, "taskman", None)
+                if tm and hasattr(tm, "run_on_main"):
+                    tm.run_on_main(fn)
+                    return
+            except Exception:
+                pass
+            try:
+                qt.QTimer.singleShot(0, fn)
+            except Exception:
+                fn()
+
+        def task() -> int:
+            from aqt import mw
+
+            col = mw.col
+            cleared = 0
+            for nid in clear_nids:
+                try:
+                    note = col.get_note(nid)
+                    changed = False
+                    if pk_field and pk_field in [
+                        f["name"] for f in note.model()["flds"]
+                    ]:
+                        if str(note[pk_field] or "").strip():
+                            note[pk_field] = ""
+                            changed = True
+                    if canonical_field and canonical_field in [
+                        f["name"] for f in note.model()["flds"]
+                    ]:
+                        if str(note[canonical_field] or "").strip():
+                            note[canonical_field] = ""
+                            changed = True
+                    if changed:
+                        col.update_note(note)
+                        cleared += 1
+                except Exception:
+                    continue
+            return cleared
+
+        def on_done(result: Optional[int], err: Optional[BaseException]) -> None:
+            self._set_busy_progress(False)
+            self._set_progress(100)
+            if err is not None:
+                self._set_status("Ready")
+                self._log(f"Failed to clear duplicate PKs: {err}")
+                return
+            self._log(f"Cleared PK on {result or 0} note(s). Re-running Dry Run\u2026")
+            self._set_status("Ready")
+            self._on_dry_run()
+
+        def run_in_background(task_fn: Callable[[], Any]) -> None:
+            try:
+                from aqt import mw
+
+                tm = getattr(mw, "taskman", None)
+                if tm and hasattr(tm, "run_in_background"):
+
+                    def _done(fut) -> None:  # type: ignore[no-untyped-def]
+                        try:
+                            res = fut.result()
+                            call_on_main(lambda: on_done(res, None))
+                        except BaseException as e:
+                            call_on_main(lambda: on_done(None, e))
+
+                    tm.run_in_background(task_fn, _done)
+                    return
+            except Exception:
+                pass
+
+            def _worker() -> None:
+                try:
+                    res = task_fn()
+                    call_on_main(lambda: on_done(res, None))
+                except BaseException as e:
+                    call_on_main(lambda: on_done(None, e))
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        run_in_background(task)
+
+    def _resolve_generic_conflict(
+        self, op: Any, conflict_idx: int, conflict_type: str
+    ) -> None:
+        plan = self._current_plan
+        if not plan:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Resolve Conflict")
+        dialog.setMinimumWidth(400)
+        dlg_layout = QVBoxLayout(dialog)
+        dlg_layout.setSpacing(12)
+        dlg_layout.setContentsMargins(20, 16, 20, 16)
+
+        recommended = op.details.get("recommended_action", "")
+        explanation = QLabel(
+            f"<b>Conflict type:</b> {conflict_type}<br>"
+            f"<b>Term:</b> {op.term or '(unknown)'}<br>"
+            f"<b>Recommended:</b> {recommended or 'N/A'}"
+        )
+        explanation.setWordWrap(True)
+        explanation.setStyleSheet(
+            "font-size: 12px; color: palette(window-text); padding-bottom: 4px;"
+        )
+        dlg_layout.addWidget(explanation)
+
+        btn_group = QButtonGroup(dialog)
+
+        skip_radio = QRadioButton("Skip this item (remove from plan)")
+        skip_radio.setStyleSheet(
+            "font-size: 12px; color: palette(text); padding: 4px 0;"
+        )
+        skip_radio.setProperty("action", "skip")
+        skip_radio.setChecked(True)
+        btn_group.addButton(skip_radio)
+        dlg_layout.addWidget(skip_radio)
+
+        rerun_combo_ref: List[QComboBox] = []
+
+        combo_style = """
+            QComboBox {
+                padding: 6px 10px; border: 1px solid palette(mid);
+                border-radius: 5px; background: palette(window);
+                color: palette(text); font-size: 12px; min-width: 200px;
+                margin-left: 22px;
+            }
+            QComboBox:hover { border-color: palette(highlight); }
+            QComboBox QAbstractItemView {
+                background: palette(base); color: palette(text);
+                selection-background-color: palette(highlight);
+                selection-color: palette(highlighted-text);
+            }
+        """
+        radio_style = "font-size: 12px; color: palette(text); padding: 4px 0;"
+
+        if conflict_type == "anki_polysemy_needs_policy":
+            r = QRadioButton("Adjust Multi-translation policy and re-run Dry Run")
+            r.setStyleSheet(radio_style)
+            r.setProperty("action", "rerun_aggregation")
+            btn_group.addButton(r)
+            dlg_layout.addWidget(r)
+
+            c = QComboBox()
+            c.setStyleSheet(combo_style)
+            c.addItem("MIN (shortest)", TranslationAggregationPolicy.MIN)
+            c.addItem("MAX (longest)", TranslationAggregationPolicy.MAX)
+            c.addItem("AVG (median length)", TranslationAggregationPolicy.AVG)
+            c.addItem("Skip", TranslationAggregationPolicy.SKIP)
+            dlg_layout.addWidget(c)
+            rerun_combo_ref.append(c)
+
+        elif conflict_type == "ambiguous_lingq_match":
+            r = QRadioButton("Adjust Ambiguous matches policy and re-run Dry Run")
+            r.setStyleSheet(radio_style)
+            r.setProperty("action", "rerun_ambiguous")
+            btn_group.addButton(r)
+            dlg_layout.addWidget(r)
+
+            c = QComboBox()
+            c.setStyleSheet(combo_style)
+            c.addItem("Skip", AmbiguousMatchPolicy.SKIP)
+            c.addItem("Conservative skip", AmbiguousMatchPolicy.CONSERVATIVE_SKIP)
+            c.addItem(
+                "Aggressive: link first (unsafe)",
+                AmbiguousMatchPolicy.AGGRESSIVE_LINK_FIRST,
+            )
+            dlg_layout.addWidget(c)
+            rerun_combo_ref.append(c)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet("""
+            QPushButton {
+                padding: 8px 18px;
+                background: transparent;
+                border: 1px solid palette(mid);
+                border-radius: 5px;
+                font-size: 12px;
+                color: palette(window-text);
+            }
+            QPushButton:hover { background: palette(button); }
+        """)
+        cancel_btn.clicked.connect(dialog.reject)
+        button_row.addWidget(cancel_btn)
+
+        confirm_btn = QPushButton("Confirm")
+        confirm_btn.setStyleSheet("""
+            QPushButton {
+                padding: 8px 18px;
+                background: palette(highlight);
+                border: none;
+                border-radius: 5px;
+                font-weight: 600;
+                font-size: 12px;
+                color: palette(highlighted-text);
+            }
+            QPushButton:hover { background: palette(highlight); }
+        """)
+        confirm_btn.clicked.connect(dialog.accept)
+        button_row.addWidget(confirm_btn)
+
+        dlg_layout.addLayout(button_row)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        checked = btn_group.checkedButton()
+        if not checked:
+            return
+        action = str(checked.property("action") or "skip")
+
+        if action == "skip":
+            self._skip_conflict_in_plan(op, conflict_idx)
+        elif action == "rerun_aggregation" and rerun_combo_ref:
+            policy = rerun_combo_ref[0].currentData()
+            self._log(
+                f"Changing Multi-translation policy to {policy.value} and re-running"
+            )
+            self._run_options = RunOptions(
+                ambiguous_match_policy=self._run_options.ambiguous_match_policy,
+                translation_aggregation_policy=policy,
+                scheduling_write_policy=self._run_options.scheduling_write_policy,
+                progress_authority_policy=self._run_options.progress_authority_policy,
+            )
+            self._sync_combos_from_run_options()
+            self._save_run_options_for_profile()
+            self._on_dry_run()
+        elif action == "rerun_ambiguous" and rerun_combo_ref:
+            policy = rerun_combo_ref[0].currentData()
+            self._log(
+                f"Changing Ambiguous matches policy to {policy.value} and re-running"
+            )
+            self._run_options = RunOptions(
+                ambiguous_match_policy=policy,
+                translation_aggregation_policy=self._run_options.translation_aggregation_policy,
+                scheduling_write_policy=self._run_options.scheduling_write_policy,
+                progress_authority_policy=self._run_options.progress_authority_policy,
+            )
+            self._sync_combos_from_run_options()
+            self._save_run_options_for_profile()
+            self._on_dry_run()
+
+    def _skip_conflict_in_plan(self, op: Any, conflict_idx: int) -> None:
+        plan = self._current_plan
+        if not plan:
+            return
+
+        try:
+            try:
+                from .diff_engine import OP_SKIP
+            except ImportError:
+                from diff_engine import OP_SKIP  # type: ignore[no-redef]
+        except Exception:
+            OP_SKIP = "skip"  # type: ignore[assignment]
+
+        for i, plan_op in enumerate(plan.operations):
+            if plan_op is op:
+                plan.operations[i] = type(op)(
+                    op_type=OP_SKIP,
+                    anki_note_id=op.anki_note_id,
+                    lingq_pk=op.lingq_pk,
+                    term=op.term,
+                    details={"reason": "user_skipped_conflict"},
+                )
+                break
+
+        self._log(f'Skipped conflict for "{op.term}"')
+        self._display_plan(plan)
+
     def _clear_log(self) -> None:
         """Clear the log output."""
         self.log_output.clear()
@@ -1744,8 +2243,8 @@ class SyncDialog(QDialog):
                 count = counts.get(key, 0)
                 label.setText(str(count))
 
-        # Update conflicts table
         conflicts = plan.get_conflicts()
+        self._current_conflicts = list(conflicts)
         self.conflicts_header.setText(f"Conflicts ({len(conflicts)})")
         self.conflicts_table.setRowCount(len(conflicts))
 
@@ -1772,6 +2271,7 @@ class SyncDialog(QDialog):
             if label:
                 label.setText("0")
 
+        self._current_conflicts = []
         self.conflicts_header.setText("Conflicts (0)")
         self.conflicts_table.setRowCount(0)
         self.progress_bar.setValue(0)
@@ -1809,6 +2309,7 @@ class SyncDialog(QDialog):
             self.ambiguous_combo,
             self.aggregation_combo,
             self.scheduling_combo,
+            self.resolve_btn,
         ]
         for w in widgets:
             try:
