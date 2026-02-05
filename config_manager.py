@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Dict, List
 
 try:
@@ -27,12 +28,12 @@ aqt = importlib.import_module("aqt")
 mw = aqt.mw
 
 
-def _addon_root_name() -> str:
-    """Return the add-on root package name for Anki config keys.
+def _legacy_addon_root_name() -> str:
+    """Legacy add-on config key derivation (root package).
 
-    When this module is imported from a submodule (e.g. package.sub.module),
-    using __name__ will point at the submodule and break config persistence.
-    Anki stores add-on config under the add-on's root package key.
+    Historically we derived the Anki add-on config key from the import package.
+    This can break when the add-on folder name differs from the Python package
+    name (e.g. hyphens), causing persistence to read/write the wrong bucket.
     """
 
     package = __package__ or ""
@@ -43,11 +44,78 @@ def _addon_root_name() -> str:
     if name:
         return name.split(".", 1)[0]
 
-    # Extremely defensive fallback; should not happen in normal imports.
     return "lingq_anki"
 
 
-_ADDON_CONFIG_KEY = _addon_root_name()
+def _addon_folder_name() -> str:
+    """Return the real Anki add-on folder name used for config storage."""
+
+    try:
+        return Path(__file__).resolve().parent.name
+    except Exception:
+        return ""
+
+
+_LEGACY_ADDON_CONFIG_KEY = _legacy_addon_root_name()
+_ADDON_CONFIG_KEY = _addon_folder_name() or _LEGACY_ADDON_CONFIG_KEY
+
+
+def _migrate_addon_config_key_if_needed() -> None:
+    """Best-effort migration from legacy config bucket to the real folder key.
+
+    If the legacy key differs from the folder key, merge legacy config into the
+    new bucket. Preserve `ui_state.last_run_options` (per-profile) so run option
+    persistence survives upgrades.
+    """
+
+    old_key = str(_LEGACY_ADDON_CONFIG_KEY or "").strip()
+    new_key = str(_ADDON_CONFIG_KEY or "").strip()
+    if not old_key or not new_key or old_key == new_key:
+        return
+
+    try:
+        old_data = mw.addonManager.getConfig(old_key)
+    except Exception:
+        old_data = None
+    if not isinstance(old_data, dict) or not old_data:
+        return
+
+    try:
+        new_data = mw.addonManager.getConfig(new_key)
+    except Exception:
+        new_data = None
+    if not isinstance(new_data, dict):
+        new_data = {}
+
+    merged: Dict[str, Any] = dict(new_data)
+    for k, v in old_data.items():
+        if k not in merged:
+            merged[k] = v
+
+    # Preserve/merge ui_state.last_run_options (fill missing profile entries).
+    old_ui = old_data.get("ui_state")
+    if isinstance(old_ui, dict):
+        old_last = old_ui.get("last_run_options")
+        if isinstance(old_last, dict) and old_last:
+            new_ui = merged.get("ui_state")
+            if not isinstance(new_ui, dict):
+                new_ui = {}
+            new_last = new_ui.get("last_run_options")
+            if not isinstance(new_last, dict):
+                new_last = {}
+            for profile_name, payload in old_last.items():
+                if profile_name not in new_last and isinstance(payload, dict):
+                    new_last[profile_name] = payload
+            new_ui["last_run_options"] = new_last
+            merged["ui_state"] = new_ui
+
+    if merged == new_data:
+        return
+
+    try:
+        mw.addonManager.writeConfig(new_key, merged)
+    except Exception:
+        return
 
 
 def config_to_dict(config: Config) -> dict:
@@ -150,6 +218,11 @@ def dict_to_config(data: dict) -> Config:
 
 
 def load_config() -> Config:
+    try:
+        _migrate_addon_config_key_if_needed()
+    except Exception:
+        pass
+
     try:
         data = mw.addonManager.getConfig(_ADDON_CONFIG_KEY)
     except Exception:

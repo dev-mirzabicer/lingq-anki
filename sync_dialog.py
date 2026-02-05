@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib
 import threading
 import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
 if TYPE_CHECKING:
@@ -83,6 +84,7 @@ QWidget = qt.QWidget
 QMessageBox = qt.QMessageBox
 QRadioButton = qt.QRadioButton
 QButtonGroup = qt.QButtonGroup
+QCheckBox = qt.QCheckBox
 
 # Import table widget separately for clarity
 _QTableWidget = qt.QTableWidget
@@ -507,6 +509,15 @@ class SyncDialog(QDialog):
         except Exception:
             pass
 
+        # Fallback: derive the real Anki add-on folder name (same strategy as config_manager).
+        try:
+            key = Path(__file__).resolve().parent.name
+            if key.strip():
+                return key.strip()
+        except Exception:
+            pass
+
+        # Legacy fallback: root package name.
         package = __package__ or ""
         if package:
             return package.split(".", 1)[0]
@@ -1526,7 +1537,7 @@ class SyncDialog(QDialog):
         if conflicts:
             self._log(
                 f"Apply blocked: {len(conflicts)} conflict(s) present. "
-                "Resolve conflicts via Dry Run (conflict UI coming soon)."
+                "Resolve conflicts via Dry Run."
             )
             self._update_button_states()
             return
@@ -1743,28 +1754,212 @@ class SyncDialog(QDialog):
         else:
             self._log("Self-check: run options valid")
 
+        addon_key = self._get_addon_config_key()
+        self._log(f"Self-check: addon config key = {addon_key}")
+
         profile = self._get_selected_profile()
         if not profile:
             checks_ok = False
-            self._log("Self-check: no profile selected for meta persistence test")
+            self._log("Self-check: no profile selected for persistence tests")
         else:
+            profile_key = str(profile.name)
+            missing = object()
+
+            run_previous_container = missing
+            run_previous_is_dict = False
+            run_previous_value = missing
+
+            try:
+                config = self._addon_config_get()
+                ui_state = config.get("ui_state") if isinstance(config, dict) else None
+                if not isinstance(ui_state, dict):
+                    ui_state = {}
+
+                run_previous_container = ui_state.get("last_run_options", missing)
+                run_previous_is_dict = isinstance(run_previous_container, dict)
+                if run_previous_is_dict:
+                    run_previous_value = run_previous_container.get(
+                        profile_key, missing
+                    )
+
+                sentinel_value = (
+                    f"self_check:addon_config:run_options:{uuid.uuid4().hex}"
+                )
+                payload = {"_self_check": sentinel_value}
+
+                last_run = run_previous_container if run_previous_is_dict else {}
+                last_run[profile_key] = payload
+                ui_state["last_run_options"] = last_run
+                config["ui_state"] = ui_state
+                self._addon_config_set(config)
+
+                read_back = self._addon_config_get()
+                read_ui_state = (
+                    read_back.get("ui_state") if isinstance(read_back, dict) else None
+                )
+                read_last_run = (
+                    read_ui_state.get("last_run_options")
+                    if isinstance(read_ui_state, dict)
+                    else None
+                )
+                read_value = (
+                    read_last_run.get(profile_key)
+                    if isinstance(read_last_run, dict)
+                    else None
+                )
+                if read_value == payload:
+                    self._log("Self-check: addon-config run options persistence OK")
+                else:
+                    checks_ok = False
+                    self._log("Self-check: addon-config run options persistence FAIL")
+            except Exception as e:
+                checks_ok = False
+                self._log(
+                    f"Self-check: addon-config run options persistence error: {e}"
+                )
+            finally:
+                try:
+                    restore_config = self._addon_config_get()
+                    restore_ui_state = (
+                        restore_config.get("ui_state")
+                        if isinstance(restore_config, dict)
+                        else None
+                    )
+                    if not isinstance(restore_ui_state, dict):
+                        restore_ui_state = {}
+
+                    if run_previous_container is missing:
+                        current_last = restore_ui_state.get("last_run_options")
+                        if isinstance(current_last, dict):
+                            current_last.pop(profile_key, None)
+                            if not current_last:
+                                restore_ui_state.pop("last_run_options", None)
+                    elif run_previous_is_dict:
+                        current_last = restore_ui_state.get("last_run_options")
+                        if not isinstance(current_last, dict):
+                            current_last = {}
+                        if run_previous_value is missing:
+                            current_last.pop(profile_key, None)
+                        else:
+                            current_last[profile_key] = run_previous_value
+                        restore_ui_state["last_run_options"] = current_last
+                    else:
+                        restore_ui_state["last_run_options"] = run_previous_container
+
+                    restore_config["ui_state"] = restore_ui_state
+                    self._addon_config_set(restore_config)
+                except Exception:
+                    pass
+
+            ignored_previous_container = missing
+            ignored_previous_is_dict = False
+            ignored_previous_value = missing
+
+            try:
+                config = self._addon_config_get()
+                ui_state = config.get("ui_state") if isinstance(config, dict) else None
+                if not isinstance(ui_state, dict):
+                    ui_state = {}
+
+                ignored_previous_container = ui_state.get("ignored_conflicts", missing)
+                ignored_previous_is_dict = isinstance(ignored_previous_container, dict)
+                if ignored_previous_is_dict:
+                    ignored_previous_value = ignored_previous_container.get(
+                        profile_key, missing
+                    )
+
+                sentinel_value = (
+                    f"self_check:addon_config:ignored_conflicts:{uuid.uuid4().hex}"
+                )
+                payload = [{"_self_check": sentinel_value}]
+
+                ignored = ignored_previous_container if ignored_previous_is_dict else {}
+                ignored[profile_key] = payload
+                ui_state["ignored_conflicts"] = ignored
+                config["ui_state"] = ui_state
+                self._addon_config_set(config)
+
+                read_back = self._addon_config_get()
+                read_ui_state = (
+                    read_back.get("ui_state") if isinstance(read_back, dict) else None
+                )
+                read_ignored = (
+                    read_ui_state.get("ignored_conflicts")
+                    if isinstance(read_ui_state, dict)
+                    else None
+                )
+                read_value = (
+                    read_ignored.get(profile_key)
+                    if isinstance(read_ignored, dict)
+                    else None
+                )
+                if read_value == payload:
+                    self._log(
+                        "Self-check: addon-config ignored conflicts persistence OK"
+                    )
+                else:
+                    checks_ok = False
+                    self._log(
+                        "Self-check: addon-config ignored conflicts persistence FAIL"
+                    )
+            except Exception as e:
+                checks_ok = False
+                self._log(
+                    f"Self-check: addon-config ignored conflicts persistence error: {e}"
+                )
+            finally:
+                try:
+                    restore_config = self._addon_config_get()
+                    restore_ui_state = (
+                        restore_config.get("ui_state")
+                        if isinstance(restore_config, dict)
+                        else None
+                    )
+                    if not isinstance(restore_ui_state, dict):
+                        restore_ui_state = {}
+
+                    if ignored_previous_container is missing:
+                        current_ignored = restore_ui_state.get("ignored_conflicts")
+                        if isinstance(current_ignored, dict):
+                            current_ignored.pop(profile_key, None)
+                            if not current_ignored:
+                                restore_ui_state.pop("ignored_conflicts", None)
+                    elif ignored_previous_is_dict:
+                        current_ignored = restore_ui_state.get("ignored_conflicts")
+                        if not isinstance(current_ignored, dict):
+                            current_ignored = {}
+                        if ignored_previous_value is missing:
+                            current_ignored.pop(profile_key, None)
+                        else:
+                            current_ignored[profile_key] = ignored_previous_value
+                        restore_ui_state["ignored_conflicts"] = current_ignored
+                    else:
+                        restore_ui_state["ignored_conflicts"] = (
+                            ignored_previous_container
+                        )
+
+                    restore_config["ui_state"] = restore_ui_state
+                    self._addon_config_set(restore_config)
+                except Exception:
+                    pass
+
             try:
                 key = f"lingq_sync:self_check:{profile.name}"
-                sentinel_value = f"self_check:{uuid.uuid4().hex}"
+                sentinel_value = f"self_check:legacy_pm_meta:{uuid.uuid4().hex}"
                 previous_value = self._pm_meta_get(key, None)
                 self._pm_meta_set(key, sentinel_value)
                 read_back = self._pm_meta_get(key, None)
                 if read_back == sentinel_value:
-                    self._log("Self-check: run options persistence OK")
+                    self._log("Self-check: legacy pm.meta run options persistence OK")
                 else:
                     checks_ok = False
-                    self._log(
-                        "Self-check: run options persistence failed (sentinel mismatch)"
-                    )
+                    self._log("Self-check: legacy pm.meta run options persistence FAIL")
                 self._pm_meta_set(key, previous_value)
             except Exception as e:
                 checks_ok = False
-                self._log(f"Self-check: run options persistence error: {e}")
+                self._log(
+                    f"Self-check: legacy pm.meta run options persistence error: {e}"
+                )
 
         if checks_ok:
             self._set_status("Self-check passed")
@@ -2220,6 +2415,13 @@ class SyncDialog(QDialog):
             dlg_layout.addWidget(c)
             rerun_combo_ref.append(c)
 
+        remember_cb = QCheckBox("Remember this decision (don\u2019t show again)")
+        remember_cb.setChecked(True)
+        remember_cb.setStyleSheet(
+            "font-size: 11px; color: palette(window-text); padding: 6px 0 2px 0;"
+        )
+        dlg_layout.addWidget(remember_cb)
+
         button_row = QHBoxLayout()
         button_row.addStretch()
 
@@ -2265,7 +2467,8 @@ class SyncDialog(QDialog):
         action = str(checked.property("action") or "skip")
 
         if action == "skip":
-            self._skip_conflict_in_plan(op, conflict_idx)
+            persist = remember_cb.isChecked()
+            self._skip_conflict_in_plan(op, conflict_idx, persist=persist)
         elif action == "rerun_aggregation" and rerun_combo_ref:
             policy = rerun_combo_ref[0].currentData()
             self._log(
@@ -2295,7 +2498,9 @@ class SyncDialog(QDialog):
             self._save_run_options_for_profile()
             self._on_dry_run()
 
-    def _skip_conflict_in_plan(self, op: Any, conflict_idx: int) -> None:
+    def _skip_conflict_in_plan(
+        self, op: Any, conflict_idx: int, *, persist: bool = False
+    ) -> None:
         plan = self._current_plan
         if not plan:
             return
@@ -2320,7 +2525,154 @@ class SyncDialog(QDialog):
                 break
 
         self._log(f'Skipped conflict for "{op.term}"')
+
+        if persist:
+            self._save_ignored_conflict(op)
+
         self._display_plan(plan)
+
+    # === Ignored Conflict Persistence ===
+
+    @staticmethod
+    def _make_conflict_match_key(op: Any) -> Dict[str, Any]:
+        """Build a stable match key dict for a conflict operation.
+
+        Only non-null identifiers are stored so that matching is strict:
+        all stored fields must match for the rule to apply.
+        """
+        conflict_type = ""
+        if hasattr(op, "details") and isinstance(op.details, dict):
+            conflict_type = str(op.details.get("conflict_type", "") or "")
+
+        key: Dict[str, Any] = {}
+        if conflict_type:
+            key["conflict_type"] = conflict_type
+        if getattr(op, "anki_note_id", None) is not None:
+            key["anki_note_id"] = int(op.anki_note_id)
+        if getattr(op, "lingq_pk", None) is not None:
+            key["lingq_pk"] = int(op.lingq_pk)
+        term = str(getattr(op, "term", "") or "").strip().lower()
+        if term:
+            key["term"] = term
+        return key
+
+    def _save_ignored_conflict(self, op: Any) -> None:
+        """Persist an ignore rule for a conflict so it auto-skips on future runs."""
+        profile = self._get_selected_profile()
+        if not profile:
+            return
+
+        match_key = self._make_conflict_match_key(op)
+        if not match_key:
+            return
+
+        config = self._addon_config_get()
+        ui_state = config.get("ui_state") if isinstance(config, dict) else None
+        if not isinstance(ui_state, dict):
+            ui_state = {}
+
+        ignored: Dict[str, list] = ui_state.get("ignored_conflicts", {})
+        if not isinstance(ignored, dict):
+            ignored = {}
+
+        profile_key = str(profile.name)
+        rules: list = ignored.get(profile_key, [])
+        if not isinstance(rules, list):
+            rules = []
+
+        # Avoid duplicates.
+        for existing in rules:
+            if isinstance(existing, dict) and existing == match_key:
+                return
+
+        rules.append(match_key)
+        ignored[profile_key] = rules
+        ui_state["ignored_conflicts"] = ignored
+        config["ui_state"] = ui_state
+        self._addon_config_set(config)
+
+        self._log(
+            f"Saved ignore rule: {match_key.get('conflict_type', '?')} "
+            f"term={match_key.get('term', '?')}"
+        )
+
+    def _load_ignored_conflicts(self) -> List[Dict[str, Any]]:
+        """Load ignore rules for the current profile from add-on config."""
+        profile = self._get_selected_profile()
+        if not profile:
+            return []
+
+        try:
+            config = self._addon_config_get()
+            ui_state = config.get("ui_state") if isinstance(config, dict) else None
+            if not isinstance(ui_state, dict):
+                return []
+            ignored = ui_state.get("ignored_conflicts")
+            if not isinstance(ignored, dict):
+                return []
+            rules = ignored.get(str(profile.name), [])
+            if not isinstance(rules, list):
+                return []
+            return [r for r in rules if isinstance(r, dict) and r]
+        except Exception:
+            return []
+
+    def _conflict_matches_ignore_rule(self, op: Any, rule: Dict[str, Any]) -> bool:
+        """Check whether a conflict operation matches a stored ignore rule.
+
+        All non-null fields in the rule must match the operation.
+        """
+        if not rule:
+            return False
+
+        op_key = self._make_conflict_match_key(op)
+
+        for field, expected in rule.items():
+            actual = op_key.get(field)
+            if actual is None:
+                # Rule requires a field the op doesn't have → no match.
+                return False
+            if actual != expected:
+                return False
+        return True
+
+    def _auto_skip_ignored_conflicts(self, plan: "SyncPlan") -> int:
+        """Convert OP_CONFLICT operations matching ignore rules into OP_SKIP.
+
+        Returns the number of conflicts auto-skipped.
+        """
+        try:
+            try:
+                from .diff_engine import OP_CONFLICT, OP_SKIP
+            except ImportError:
+                from diff_engine import OP_CONFLICT, OP_SKIP  # type: ignore[no-redef]
+        except Exception:
+            OP_CONFLICT = "conflict"  # type: ignore[assignment]
+            OP_SKIP = "skip"  # type: ignore[assignment]
+
+        rules = self._load_ignored_conflicts()
+        if not rules:
+            return 0
+
+        skipped = 0
+        for i, op in enumerate(plan.operations):
+            if op.op_type != OP_CONFLICT:
+                continue
+            for rule in rules:
+                if self._conflict_matches_ignore_rule(op, rule):
+                    plan.operations[i] = type(op)(
+                        op_type=OP_SKIP,
+                        anki_note_id=op.anki_note_id,
+                        lingq_pk=op.lingq_pk,
+                        term=op.term,
+                        details={"reason": "ignored_conflict"},
+                    )
+                    ct = rule.get("conflict_type", "?")
+                    term = rule.get("term", "?")
+                    self._log(f"Auto-skipped conflict: {ct} term={term}")
+                    skipped += 1
+                    break  # one rule match is enough
+        return skipped
 
     def _clear_log(self) -> None:
         """Clear the log output."""
@@ -2330,6 +2682,10 @@ class SyncDialog(QDialog):
 
     def _display_plan(self, plan: "SyncPlan") -> None:
         """Display sync plan results in the UI."""
+        auto_skipped = self._auto_skip_ignored_conflicts(plan)
+        if auto_skipped:
+            self._log(f"Auto-skipped {auto_skipped} previously ignored conflict(s)")
+
         self._current_plan = plan
         self._update_button_states()
 
